@@ -12,4 +12,6 @@ func SetupRouter(r *gin.Engine) {
     r.POST("/room/join", handlers.JoinRoom)
     r.GET("/ws/:roomId", handlers.WSHandler) // WebSocket 端点
     r.GET("/room/:id/replay", handlers.GetReplay) // 回放路由
+    r.POST("/room/:id/upload", handlers.UploadImage) // 图片上传
+    r.GET("/room/:id/export", handlers.ExportBoard)  // 黑板导出
 }

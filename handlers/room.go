@@ -1,13 +1,20 @@
 package handlers
 
 import (
-    "collaborative-blackboard/config"
-    "collaborative-blackboard/models"
-    "crypto/rand"
-    "github.com/gin-gonic/gin"
-    "net/http"
-    "time"
+	"collaborative-blackboard/config"
+	"collaborative-blackboard/models"
+	"crypto/rand"
+	"encoding/json"
+	"image"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"time"
+
+	"github.com/disintegration/imaging"
+	"github.com/gin-gonic/gin"
 )
 
 // generateInviteCode 生成 6 位随机邀请码
@@ -147,4 +154,120 @@ func GetReplay(c *gin.Context) {
         "room_id": roomID,
         "actions": actions,
     })
+}
+
+// UploadImage 上传图片到房间
+func UploadImage(c *gin.Context) {
+    roomIDStr := c.Param("id")
+    roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room ID"})
+        return
+    }
+
+    var room models.Room
+    if err := config.DB.First(&room, uint(roomID)).Error; err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": "Room not found"})
+        return
+    }
+
+    // 获取上传文件
+    file, header, err := c.Request.FormFile("image")
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get image"})
+        return
+    }
+    defer file.Close()
+
+    // 生成文件名
+    filename := strconv.FormatUint(uint64(roomID), 10) + "_" + strconv.FormatInt(time.Now().UnixNano(), 10) + filepath.Ext(header.Filename)
+    filepath := filepath.Join("uploads", filename)
+
+    // 保存文件
+    out, err := os.Create(filepath)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save image"})
+        return
+    }
+    defer out.Close()
+    _, err = io.Copy(out, file)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write image"})
+        return
+    }
+
+    // 记录到数据库
+    action := models.Action{
+        RoomID:     uint(roomID),
+        UserID:     1, // 硬编码，后续优化
+        ActionType: "image",
+        Data:       `{"filename": "` + filename + `"}`,
+        Timestamp:  time.Now(),
+    }
+    if err := config.DB.Create(&action).Error; err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save action"})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message":  "Image uploaded",
+        "room_id":  roomID,
+        "filename": filename,
+    })
+}
+
+// ExportBoard 导出黑板状态为图片
+func ExportBoard(c *gin.Context) {
+    roomIDStr := c.Param("id")
+    roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room ID"})
+        return
+    }
+
+    var room models.Room
+    if err := config.DB.First(&room, uint(roomID)).Error; err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": "Room not found"})
+        return
+    }
+
+    // 获取所有操作
+    var actions []models.Action
+    if err := config.DB.Where("room_id = ?", roomID).Order("timestamp ASC").Find(&actions).Error; err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch actions"})
+        return
+    }
+
+    // 创建空白画布（假设 800x600）
+    canvas := imaging.New(800, 600, image.White)
+
+    // 应用所有操作（简化，只处理图片）
+    for _, action := range actions {
+        if action.ActionType == "image" {
+            var data struct {
+                Filename string `json:"filename"`
+            }
+            if err := json.Unmarshal([]byte(action.Data), &data); err != nil {
+                continue
+            }
+            imgPath := filepath.Join("uploads", data.Filename)
+            img, err := imaging.Open(imgPath)
+            if err != nil {
+                continue
+            }
+            // 简单叠加（假设图片位置固定）
+            canvas = imaging.Paste(canvas, img, image.Pt(0, 0))
+        }
+    }
+
+    // 保存导出图片
+    exportFilename := "board_" + roomIDStr + ".png"
+    exportPath := filepath.Join("uploads", exportFilename)
+    if err := imaging.Save(canvas, exportPath); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to export board"})
+        return
+    }
+
+    // 返回文件
+    c.File(exportPath)
 }
