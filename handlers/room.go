@@ -107,3 +107,44 @@ func JoinRoom(c *gin.Context) {
         "room_id": room.ID,
     })
 }
+
+// GetReplay 获取房间的涂鸦历史
+func GetReplay(c *gin.Context) {
+    roomIDStr := c.Param("id")
+    roomID, err := strconv.ParseUint(roomIDStr, 10, 32)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid room ID"})
+        return
+    }
+
+    var room models.Room
+    if err := config.DB.First(&room, uint(roomID)).Error; err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": "Room not found"})
+        return
+    }
+
+    // 先尝试从 Redis 获取最近操作
+    cacheKey := "room:" + roomIDStr + ":recent"
+    cachedActions, err := config.Redis.LRange(c.Request.Context(), cacheKey, 0, -1).Result()
+    if err == nil && len(cachedActions) > 0 {
+        c.JSON(http.StatusOK, gin.H{
+            "message": "Replay data from cache",
+            "room_id": roomID,
+            "actions": cachedActions,
+        })
+        return
+    }
+
+    // 如果缓存为空，从 MySQL 查询
+    var actions []models.Action
+    if err := config.DB.Where("room_id = ?", roomID).Order("timestamp ASC").Find(&actions).Error; err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch actions"})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Replay data retrieved",
+        "room_id": roomID,
+        "actions": actions,
+    })
+}
