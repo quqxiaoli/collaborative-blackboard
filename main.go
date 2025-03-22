@@ -1,21 +1,26 @@
 package main
 
 import (
+    "collaborative-blackboard/config"
     "github.com/gin-gonic/gin"
 )
 
 // main 是程序入口
 func main() {
-    // 初始化 Gin，默认包含日志和恢复中间件
+    // 初始化数据库和 Redis
+    config.InitDB()
+    config.InitRedis()
+
+    // 初始化 Gin
     r := gin.Default()
 
-    // 定义 /ping 端点，返回 JSON 响应
+    // 定义 /ping 端点
     r.GET("/ping", func(c *gin.Context) {
         c.JSON(200, gin.H{
             "message": "pong",
         })
     })
 
-    // 启动服务，监听 8080 端口
-    r.Run(":8080") // 默认 localhost:8080
+    // 启动服务
+    r.Run(":8080")
 }
