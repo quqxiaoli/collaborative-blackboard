@@ -2,6 +2,7 @@ package main
 
 import (
     "collaborative-blackboard/config"
+	"collaborative-blackboard/routes"
     "github.com/gin-gonic/gin"
 )
 
@@ -13,6 +14,9 @@ func main() {
     config.InitRedis()
 
     r := gin.Default()
+	// 设置路由
+    routes.SetupRouter(r)
+	
     r.GET("/ping", func(c *gin.Context) {
         c.JSON(200, gin.H{
             "message": "pong",
