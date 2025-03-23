@@ -7,9 +7,16 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+)
+
+// 定义全局缓冲区和锁
+var (
+    actionBuffer []models.Action
+    bufferMutex  sync.Mutex
 )
 
 // 全局连接池，key 为 roomID
@@ -47,48 +54,79 @@ func WSHandler(c *gin.Context) {
 	pubsub := config.Redis.Subscribe(c.Request.Context(), "room:"+roomIDStr)
 	defer pubsub.Close()
 
-	go func() {
-		ch := pubsub.Channel()
-		for msg := range ch {
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
-				log.Println("Write error:", err)
-				return
-			}
-		}
-	}()
-
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			log.Println("Read error:", err)
-			break
-		}
-
-		// 生成操作序列号
-        seqKey := "room:" + roomIDStr + ":seq"
-        seq, err := config.Redis.Incr(c.Request.Context(), seqKey).Result()
-        if err != nil {
-            log.Println("Failed to generate sequence:", err)
-            continue
+	// 启动写入 goroutine
+    go func() {
+        ch := pubsub.Channel()
+        for msg := range ch {
+            if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
+                log.Println("Write error:", err)
+                return
+            }
         }
+    }()
 
-        action := models.Action{
-            RoomID:     uint(roomID),
-            UserID:     1,
-            ActionType: "draw",
-            Data:       string(msg),
-            Timestamp:  time.Now(),
+    // 启动读取 goroutine
+    go func() {
+        defer conn.Close() // 确保读取出错时关闭连接
+        for {
+            _, msg, err := conn.ReadMessage()
+            if err != nil {
+                log.Println("Read error:", err)
+                return
+            }
+
+            // 生成操作序列号
+            seqKey := "room:" + roomIDStr + ":seq"
+            seq, err := config.Redis.Incr(c.Request.Context(), seqKey).Result()
+            if err != nil {
+                log.Println("Failed to generate sequence:", err)
+                continue
+            }
+			// 创建操作
+            action := models.Action{
+                RoomID:     uint(roomID),
+                UserID:     1, // 后续替换为 JWT
+                ActionType: "draw",
+                Data:       string(msg),
+                Timestamp:  time.Now(),
+            }
+
+            // 添加到缓冲区
+            bufferMutex.Lock()
+            actionBuffer = append(actionBuffer, action)
+            if len(actionBuffer) >= 100 { // 达到 100 条时写入
+                if err := config.DB.Create(&actionBuffer).Error; err != nil {
+                    log.Println("Failed to batch save actions:", err)
+                }
+                actionBuffer = nil // 清空缓冲区
+            }
+            bufferMutex.Unlock()
+
+            // 缓存和发布（保持不变）
+            cacheKey := "room:" + roomIDStr + ":recent"
+            config.Redis.RPush(c.Request.Context(), cacheKey, string(msg))
+            config.Redis.LTrim(c.Request.Context(), cacheKey, -100, -1)
+            payload := strconv.FormatInt(seq, 10) + "|" + string(msg)
+            config.Redis.Publish(c.Request.Context(), "room:"+roomIDStr, payload)
         }
-        if err := config.DB.Create(&action).Error; err != nil {
-            log.Println("Failed to save action:", err)
+    }()
+
+	// 启动定时批量写入（全局唯一）
+    go func() {
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+            bufferMutex.Lock()
+            if len(actionBuffer) > 0 { // 有数据时写入
+                if err := config.DB.Create(&actionBuffer).Error; err != nil {
+                    log.Println("Failed to batch save actions:", err)
+                }
+                actionBuffer = nil
+            }
+            bufferMutex.Unlock()
         }
+    }()
 
-        cacheKey := "room:" + roomIDStr + ":recent"
-        config.Redis.RPush(c.Request.Context(), cacheKey, string(msg))
-        config.Redis.LTrim(c.Request.Context(), cacheKey, -100, -1)
-
-        // 发布消息，附加序列号
-        payload := strconv.FormatInt(seq, 10) + "|" + string(msg)
-        config.Redis.Publish(c.Request.Context(), "room:"+roomIDStr, payload)
-    }
+    // 主 goroutine 保持连接存活
+    select {}
 }
