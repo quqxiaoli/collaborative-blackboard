@@ -1,71 +1,65 @@
 package middleware
 
 import (
-	"log"
-	"net/http"
-	"strings"
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v4"
+    "github.com/gin-gonic/gin"
+    "github.com/golang-jwt/jwt/v4"
+    "github.com/sirupsen/logrus"
+    "net/http"
+    "os"
+    "strings"
 )
 
 func Auth() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
-			c.Abort()
-			return
-		}
-
-		parts := strings.Split(authHeader, " ")
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format"})
-			c.Abort()
-			return
-		}
-
-		tokenStr := parts[1]
-		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return []byte("secret"), nil // 替换为安全的密钥
-		})
-
-		if err != nil {
-            if err == jwt.ErrSignatureInvalid {
-                c.JSON(http.StatusUnauthorized, gin.H{"error": "Token signature is invalid"})
-            } else if ve, ok := err.(*jwt.ValidationError); ok {
-                if ve.Errors&jwt.ValidationErrorExpired != 0 {
-                    c.JSON(http.StatusUnauthorized, gin.H{"error": "Token has expired"})
-                } else if ve.Errors&jwt.ValidationErrorMalformed != 0 {
-                    c.JSON(http.StatusUnauthorized, gin.H{"error": "Token is malformed"})
-                } else {
-                    c.JSON(http.StatusUnauthorized, gin.H{"error": "Token validation failed"})
-                }
-            } else {
-                c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
-            }
+    return func(c *gin.Context) {
+        tokenStr, err := extractToken(c)
+        if err != nil {
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "Token not found"})
             c.Abort()
             return
         }
 
-        if !token.Valid {
-            c.JSON(http.StatusUnauthorized, gin.H{"error": "Token is not valid"})
-            c.Abort()
-            return
-        }
-
-        claims, ok := token.Claims.(jwt.MapClaims)
-        if !ok {
-            c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
+        claims, err := validateToken(tokenStr)
+        if err != nil {
+            c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
             c.Abort()
             return
         }
 
         userID := uint(claims["user_id"].(float64))
-        log.Printf("Authenticated user_id: %d", userID)
+        logrus.WithField("user_id", userID).Info("User authenticated")
         c.Set("user_id", userID)
         c.Next()
     }
+}
+
+func extractToken(c *gin.Context) (string, error) {
+    authHeader := c.GetHeader("Authorization")
+    if authHeader == "" {
+        return "", nil // 改为 nil 或自定义错误
+    }
+    parts := strings.Split(authHeader, " ")
+    if len(parts) != 2 || parts[0] != "Bearer" {
+        return "", jwt.ErrTokenMalformed
+    }
+    return parts[1], nil
+}
+func validateToken(tokenStr string) (jwt.MapClaims, error) {
+    secret := os.Getenv("JWT_SECRET")
+    if secret == "" {
+        secret = "" // 安全的默认值
+    }
+
+    token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+        if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+            return nil, jwt.ErrSignatureInvalid
+        }
+        return []byte(secret), nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+        return claims, nil
+    }
+    return nil, nil
 }
