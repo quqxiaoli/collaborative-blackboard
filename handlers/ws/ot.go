@@ -215,12 +215,12 @@ func updateRedisState(ctx context.Context, roomID uint, action models.Action, lo
 		logCtx.WithError(err).Warn("Failed to parse action data for Redis state update")
 	}
 
-	// Execute the pipeline
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		logCtx.WithError(err).Error("Failed to execute Redis pipeline for state update")
+	// 执行 pipeline
+	_, execErr := pipe.Exec(ctx) // 重命名 err 变量以避免与内部的 err 冲突
+	if execErr != nil {
+		logCtx.WithError(execErr).Error("执行 Redis pipeline 进行状态更新失败") // Failed to execute Redis pipeline for state update
 	} else {
-		logCtx.Debug("Redis state updated successfully")
+		logCtx.Debug("Redis 状态更新成功") // Redis state updated successfully
 	}
 }
 
@@ -300,21 +300,23 @@ func publishAction(ctx context.Context, roomID uint, action models.Action, logCt
 		return
 	}
 
-	// Payload format: "version|json_data" (Consider a more robust format like JSON object if needed)
-	payload := fmt.Sprintf("%d|%s", action.Version, string(actionBytes))
+	// 载荷格式：直接使用 Action 的 JSON 字符串。客户端需要解析 JSON 并处理。
+	// 之前的 "version|json_data" 格式可能导致解析复杂。
+	payload := string(actionBytes)
 	redisChannel := fmt.Sprintf("room:%d", roomID)
 
-	// Publish the message using the provided context
-	cmd := config.Redis.Publish(ctx, redisChannel, payload)
+	// 使用后台 context 发布消息，因为原始请求可能已结束
+	pubCtx := context.Background()
+	cmd := config.Redis.Publish(pubCtx, redisChannel, payload)
 	if err := cmd.Err(); err != nil {
 		logCtx.WithError(err).WithFields(logrus.Fields{
-			"channel": redisChannel,
+			"channel":      redisChannel,
 			"payload_size": len(payload),
-		}).Error("Failed to publish action to Redis")
+		}).Error("向 Redis 发布操作失败") // Failed to publish action to Redis
 	} else {
 		logCtx.WithFields(logrus.Fields{
-			"channel": redisChannel,
-			"subscribers": cmd.Val(), // Log number of subscribers that received the message
-		}).Debug("Action published to Redis")
+			"channel":     redisChannel,
+			"subscribers": cmd.Val(), // 记录接收到消息的订阅者数量
+		}).Debug("操作已发布到 Redis") // Action published to Redis
 	}
 }
