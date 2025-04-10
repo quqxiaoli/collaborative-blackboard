@@ -38,13 +38,9 @@ func main() {
 	// 7. 设置路由
 	routes.SetupRouter(r)
 
-	// 8. 启动后台任务
-	// 启动定时生成快照的任务 (在单独的 goroutine 中运行)
-	go ws.RunSnapshotTask()
-	// 启动处理 WebSocket 动作的后台任务 (在 ws 包的 init 函数中启动)
-	// go ws.processActions() // 这个在 ws.init() 中启动了
-	// go ws.flushActionBatch() // 这个在 ws.init() 中启动了
-	// go ws.cleanupClients() // 这个在 ws.init() 中启动了
+	// 8. 创建并运行 WebSocket Hub
+	// go ws.RunSnapshotTask() // 这个任务现在由 Hub 启动
+	go ws.GetHub().Run() // 获取并运行全局 Hub 实例
 
 	// 9. 启动 HTTP 服务器
 	serverAddr := ":8080" // 可以考虑从环境变量配置端口
