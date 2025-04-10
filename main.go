@@ -4,6 +4,7 @@ import (
 	"collaborative-blackboard/config"
 	"collaborative-blackboard/handlers/ws"
 	"collaborative-blackboard/routes"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv" // 导入 godotenv
