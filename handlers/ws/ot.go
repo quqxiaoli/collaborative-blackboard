@@ -90,14 +90,19 @@ func applyOperationalTransform(task ActionTask) models.Action {
 	return finalAction
 }
 
-// transform implements a basic Operational Transformation (OT) logic.
-// This is a simplified version: if two operations affect the same coordinate,
-// the one with the higher version (or later timestamp if versions are equal) wins,
-// and the other becomes a "noop".
-// A real-world OT implementation would be significantly more complex, handling various
-// operation types (insert, delete, update) and their interactions.
+// transform 实现了一个基本的 Operational Transformation (OT) 逻辑。
+// 这是一个非常简化的版本（Last Write Wins - LWW），主要基于版本号和时间戳来解决冲突。
+// 如果两个操作影响同一坐标：
+// 1. 版本号高的操作优先。
+// 2. 如果版本号相同，时间戳晚的操作优先。
+// 3. 如果版本号和时间戳都相同（理论上不太可能，除非系统时钟有问题或并发极高），则任意选择一个（这里选择 op1）。
+// 优先级较低的操作会被标记为 "noop" (无操作)。
+//
+// 注意：这个实现没有处理更复杂的 OT 场景，例如操作的意图保留（intention preservation）
+// 或对不同类型操作（如插入/删除文本）的转换。对于简单的绘图/擦除操作，这种 LWW 策略可能足够。
+// A real-world OT implementation would be significantly more complex.
 func transform(op1, op2 models.Action) (models.Action, models.Action) {
-	// If either operation is already a no-op, return them as is.
+	// 如果任一操作已经是 no-op，则按原样返回。
 	if op1.ActionType == "noop" || op2.ActionType == "noop" {
 		return op1, op2
 	}
@@ -164,15 +169,18 @@ func transform(op1, op2 models.Action) (models.Action, models.Action) {
 	return op1, op2
 }
 
-// updateRedisState updates the current board state in Redis based on the action.
-// It also increments the operation count and adds the action to the recent actions list.
+// updateRedisState 根据操作更新 Redis 中的当前画板状态。
+// 它还会增加操作计数并将操作添加到最近操作列表中。
 func updateRedisState(ctx context.Context, roomID uint, action models.Action, logCtx *logrus.Entry) {
 	roomIDStr := strconv.FormatUint(uint64(roomID), 10)
-	stateKey := "room:" + roomIDStr + ":state"     // Hash storing the board state (coord -> color)
-	opCountKey := "room:" + roomIDStr + ":op_count" // Counter for snapshot frequency logic
-	queueKey := "room:" + roomIDStr + ":actions"   // List storing recent actions for OT
+	stateKey := fmt.Sprintf("room:%s:state", roomIDStr)     // 存储画板状态的哈希 (坐标 -> 颜色)
+	opCountKey := fmt.Sprintf("room:%s:op_count", roomIDStr) // 用于快照频率逻辑的计数器
+	queueKey := fmt.Sprintf("room:%s:actions", roomIDStr)   // 存储用于 OT 的最近操作的列表
 
-	// Use a Redis pipeline for atomicity and efficiency
+	// 使用 Redis pipeline 以保证原子性和效率
+	// 注意：虽然 TxPipeline 提供了原子性，但这里的操作序列（Incr, Expire, RPush, LTrim, HSet/HDel）
+	// 并非严格意义上的事务，因为它们依赖于多个键。Redis 的 WATCH/MULTI/EXEC 可能更适合严格事务，但这会增加复杂性。
+	// 对于此场景，Pipeline 提供了性能优势。
 	pipe := config.Redis.TxPipeline()
 
 	// Increment operation count and set expiry (e.g., 1 hour)
