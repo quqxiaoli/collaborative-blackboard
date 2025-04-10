@@ -43,21 +43,26 @@ func InitDB() {
 	sqlDB.SetMaxOpenConns(50)
 	sqlDB.SetMaxIdleConns(10)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
-	logrus.Info("MySQL connected")
+	logrus.Info("MySQL connected")             // 记录数据库连接成功信息
 }
 
-func getDSN() string {
+// getDSN 从环境变量构建数据库连接字符串 (DSN)
+// 返回 DSN 字符串和可能的错误
+func getDSN() (string, error) {
 	mysqlUser := os.Getenv("MYSQL_USER")
 	if mysqlUser == "" {
-		mysqlUser = "root"
+		// 如果环境变量未设置，应该返回错误
+		return "", fmt.Errorf("MYSQL_USER environment variable not set")
 	}
 	mysqlPassword := os.Getenv("MYSQL_PASSWORD")
 	if mysqlPassword == "" {
-		mysqlPassword = "Yb1756062305."
+		// !!! 安全警告：绝不应在代码中硬编码密码或设置不安全的默认值 !!!
+		// 如果环境变量未设置，应该返回错误，强制要求配置。
+		return "", fmt.Errorf("MYSQL_PASSWORD environment variable not set")
 	}
 	mysqlHost := os.Getenv("MYSQL_HOST")
 	if mysqlHost == "" {
-		mysqlHost = "127.0.0.1"
+		mysqlHost = "127.0.0.1" // 可以保留本地开发默认值，但生产环境应显式设置
 	}
 	mysqlPort := os.Getenv("MYSQL_PORT")
 	if mysqlPort == "" {
