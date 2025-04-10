@@ -12,6 +12,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"crypto/rand"
+	"errors" // 导入 errors 包
+	"fmt"    // 导入 fmt 包
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm" // 导入 gorm 以便使用 gorm.ErrRecordNotFound
 )
@@ -38,7 +46,7 @@ func CreateRoom(c *gin.Context) {
 	// 2. 生成唯一的邀请码
 	inviteCode, err := generateUniqueInviteCode(c.Request.Context()) // 传递 context
 	if err != nil {
-		logCtx.WithError(err).Error("CreateRoom: Failed to generate unique invite code.")
+		logCtx.WithError(err).Error("CreateRoom: 生成唯一邀请码失败。") // Failed to generate unique invite code.
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate invite code"})
 		return
 	}
@@ -54,7 +62,7 @@ func CreateRoom(c *gin.Context) {
 	}
 	// 使用请求上下文执行数据库操作
 	if err := config.DB.WithContext(c.Request.Context()).Create(&room).Error; err != nil {
-		logCtx.WithError(err).Error("CreateRoom: Failed to create room in database.")
+		logCtx.WithError(err).Error("CreateRoom: 在数据库中创建房间失败。") // Failed to create room in database.
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create room"})
 		return
 	}
@@ -65,13 +73,13 @@ func CreateRoom(c *gin.Context) {
 	// 使用 SetEx 设置过期时间，避免 Redis 中残留过多无效 key
 	redisRoomKey := "room_meta:" + strconv.FormatUint(uint64(room.ID), 10)
 	// 使用 Set 而不是 SetEx，因为 Set 的最后一个参数 0 表示永不过期，如果需要过期请用 SetEx
-	if err := config.Redis.Set(c.Request.Context(), redisRoomKey, "active", 0).Err(); err != nil {
+	if err := config.Redis.Set(c.Request.Context(), redisRoomKey, "active", 0).Err(); err != nil { // 0 表示永不过期
 		// 缓存失败通常不应阻塞主流程，记录警告即可
-		logCtx.WithError(err).Warn("CreateRoom: Failed to cache room status in Redis.")
+		logCtx.WithError(err).Warn("CreateRoom: 在 Redis 中缓存房间状态失败。") // Failed to cache room status in Redis.
 	}
 
 	// 5. 成功响应
-	logCtx.Info("Room created successfully.")
+	logCtx.Info("房间创建成功。") // Room created successfully.
 	c.JSON(http.StatusOK, gin.H{
 		"message":     "Room created successfully",
 		"room_id":     room.ID,
@@ -101,7 +109,7 @@ func JoinRoom(c *gin.Context) {
 		InviteCode string `json:"invite_code" binding:"required"` // 添加 binding 验证
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		logCtx.WithError(err).Warn("JoinRoom: Invalid input format or missing invite code.")
+		logCtx.WithError(err).Warn("JoinRoom: 无效的输入格式或缺少邀请码。") // Invalid input format or missing invite code.
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input: invite_code is required"})
 		return
 	}
@@ -113,10 +121,10 @@ func JoinRoom(c *gin.Context) {
 	err := config.DB.WithContext(c.Request.Context()).Where("invite_code = ?", input.InviteCode).First(&room).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			logCtx.Warn("JoinRoom: Room not found for the given invite code.")
+			logCtx.Warn("JoinRoom: 未找到对应邀请码的房间。") // Room not found for the given invite code.
 			c.JSON(http.StatusNotFound, gin.H{"error": "Room not found or invalid invite code"})
 		} else {
-			logCtx.WithError(err).Error("JoinRoom: Database error finding room by invite code.")
+			logCtx.WithError(err).Error("JoinRoom: 通过邀请码查找房间时数据库出错。") // Database error finding room by invite code.
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find room"})
 		}
 		return
@@ -128,7 +136,7 @@ func JoinRoom(c *gin.Context) {
 	// config.DB.Model(&room).Update("last_active", time.Now())
 
 	// 6. 成功响应
-	logCtx.Info("User joined room successfully.")
+	logCtx.Info("用户成功加入房间。") // User joined room successfully.
 	c.JSON(http.StatusOK, gin.H{"message": "Joined room successfully", "room_id": room.ID})
 }
 
@@ -145,7 +153,7 @@ func generateUniqueInviteCode(ctx context.Context) (string, error) {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		// 使用 crypto/rand 生成高质量随机字节
 		if _, err := rand.Read(b); err != nil {
-			logrus.WithError(err).Error("generateUniqueInviteCode: Failed to read random bytes.")
+			logrus.WithError(err).Error("generateUniqueInviteCode: 读取随机字节失败。") // Failed to read random bytes.
 			return "", fmt.Errorf("failed to generate random bytes: %w", err)
 		}
 
@@ -163,18 +171,18 @@ func generateUniqueInviteCode(ctx context.Context) (string, error) {
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				// 如果未找到记录 (gorm.ErrRecordNotFound)，说明 code 可用
-				logrus.WithField("invite_code", code).Infof("Generated unique invite code after %d attempt(s).", attempt+1)
+				logrus.WithField("invite_code", code).Infof("在 %d 次尝试后生成唯一邀请码。", attempt+1) // Generated unique invite code after %d attempt(s).
 				return code, nil // 成功找到唯一 code
 			}
 			// 其他数据库查询错误
-			logrus.WithError(err).WithField("invite_code", code).Error("generateUniqueInviteCode: Database error checking invite code uniqueness.")
+			logrus.WithError(err).WithField("invite_code", code).Error("generateUniqueInviteCode: 检查邀请码唯一性时数据库出错。") // Database error checking invite code uniqueness.
 			return "", fmt.Errorf("database error checking invite code uniqueness: %w", err)
 		}
 		// 如果找到了记录 (err == nil)，说明 code 已存在，继续循环尝试下一个
-		logrus.WithField("invite_code", code).Warnf("generateUniqueInviteCode: Generated code already exists, retrying (attempt %d)...", attempt+1)
+		logrus.WithField("invite_code", code).Warnf("generateUniqueInviteCode: 生成的邀请码已存在，重试 (尝试 %d)...", attempt+1) // Generated code already exists, retrying (attempt %d)...
 	}
 
 	// 如果达到最大尝试次数仍未找到唯一 code
-	logrus.Error("generateUniqueInviteCode: Failed to generate a unique invite code after maximum attempts.")
+	logrus.Error("generateUniqueInviteCode: 达到最大尝试次数后未能生成唯一邀请码。") // Failed to generate a unique invite code after maximum attempts.
 	return "", fmt.Errorf("failed to generate a unique invite code after %d attempts", maxAttempts)
 }
