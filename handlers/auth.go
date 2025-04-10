@@ -1,17 +1,18 @@
 package handlers
 
 import (
-    "collaborative-blackboard/config"
-    "collaborative-blackboard/models"
-    "fmt"
-    "net/http"
-    "os"
-    "time"
+	"collaborative-blackboard/config"
+	"collaborative-blackboard/models"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"time"
 
-    "github.com/gin-gonic/gin"
-    "github.com/golang-jwt/jwt/v4"
-    "github.com/sirupsen/logrus"
-    "golang.org/x/crypto/bcrypt"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v4"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func Register(c *gin.Context) {
@@ -31,8 +32,13 @@ func Register(c *gin.Context) {
     user.Password = hashedPassword
 
     if err := config.DB.Create(&user).Error; err != nil {
-        logrus.WithError(err).Warn("User creation failed")
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Username or email already exists"})
+        if strings.Contains(err.Error(), "unique constraint failed") {
+            logrus.WithError(err).Warn("Username or email already exists")
+            c.JSON(http.StatusBadRequest, gin.H{"error": "Username or email already exists"})
+        } else {
+            logrus.WithError(err).Error("Database error during user creation")
+            c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+        }
         return
     }
     logrus.WithField("user_id", user.ID).Info("User registered")
