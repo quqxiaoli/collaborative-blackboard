@@ -11,7 +11,6 @@ import (
 	"sync" // Import sync
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8" // Ensure redis client is imported
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
