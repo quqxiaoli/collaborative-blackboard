@@ -1,18 +1,26 @@
-// handlers/ws/ot.go
 package ws
 
 import (
+	"collaborative-blackboard/config"
 	"collaborative-blackboard/models"
+	"context"
 	"encoding/json"
+	"fmt"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
-	// "collaborative-blackboard/config" // 不再需要直接在此文件中引用
-	// "context" // 不再需要直接在此文件中引用
-	// "fmt" // 不再需要直接在此文件中引用
-	// "strconv" // 不再需要直接在此文件中引用
-	// "sync" // 不再需要直接在此文件中引用
-	// "time" // 不再需要直接在此文件中引用
-	// "github.com/go-redis/redis/v8" // 不再需要直接在此文件中引用
 )
+
+// ActionTask 表示一个需要处理的用户操作任务
+type ActionTask struct {
+	Action  models.Action
+	RoomID  uint
+	Context context.Context
+}
 
 // 注意： processActions, applyOperationalTransform, updateRedisState,
 // batchAction, flushActionBatch, publishAction
@@ -98,31 +106,7 @@ func transform(op1, op2 models.Action) (models.Action, models.Action) {
 	return op1, op2
 }
 
-// 以下函数已移至 hub.go
-/*
-func processActions() { ... }
-func applyOperationalTransform(task ActionTask) models.Action { ... }
-func updateRedisState(ctx context.Context, roomID uint, action models.Action, logCtx *logrus.Entry) { ... }
-func batchAction(action models.Action) { ... }
-func flushActionBatch() { ... }
-func publishAction(ctx context.Context, roomID uint, action models.Action, logCtx *logrus.Entry) { ... }
-*/
-package ws
-
-import (
-	"collaborative-blackboard/config"
-	"collaborative-blackboard/models"
-	"context"
-	"encoding/json"
-	"fmt"
-	"strconv"
-	"sync"
-	"time"
-
-	"github.com/go-redis/redis/v8"
-	"github.com/gorilla/websocket"
-	"github.com/sirupsen/logrus"
-)
+// 以下函数已作为 Hub 的方法实现在本文件中
 
 // --- WebSocket 常量 (Moved here for better organization) ---
 const (
@@ -137,8 +121,10 @@ const (
 
 	// 允许从对等方接收的最大消息大小。
 	maxMessageSize = 512
-)
 
+	// 清理不活跃客户端的周期
+	pingInterval = 30 * time.Minute
+)
 
 // Client 代表一个连接到 Hub 的 WebSocket 客户端。
 type Client struct {
@@ -183,7 +169,6 @@ type snapshotInfo struct {
 	interval         time.Duration
 }
 
-
 // NewHub 创建并返回一个新的 Hub 实例。
 func NewHub() *Hub {
 	return &Hub{
@@ -195,6 +180,22 @@ func NewHub() *Hub {
 		// batchMu 自动初始化
 		// roomSnapshotInfo 自动初始化
 	}
+}
+
+// 单例 Hub 实例
+var (
+	hub     *Hub
+	hubOnce sync.Once
+)
+
+// GetHub 返回全局 Hub 实例。如果该实例尚未创建，则会创建一个新实例。
+// 这确保始终有且仅有一个 Hub 实例运行。
+func GetHub() *Hub {
+	hubOnce.Do(func() {
+		hub = NewHub()
+		logrus.Info("创建全局 Hub 实例")
+	})
+	return hub
 }
 
 // Run 启动 Hub 的主循环，监听并处理来自通道的消息。
@@ -229,7 +230,6 @@ func (h *Hub) Run() {
 				sendCtx := context.Background()
 				SendSnapshot(cli.conn, cli.roomID, sendCtx)
 			}(client)
-
 
 		case client := <-h.unregister:
 			h.roomsMu.Lock()
@@ -267,14 +267,14 @@ func (h *Hub) broadcast(roomID uint, message []byte, sender *Client) {
 	}
 
 	logCtx := logrus.WithFields(logrus.Fields{
-		"room_id": roomID,
+		"room_id":        roomID,
 		"sender_user_id": sender.userID,
-		"message_size": len(message),
+		"message_size":   len(message),
 	})
 
 	clientsToUnregister := []*Client{} // 收集需要注销的客户端
 
-	h.roomsMu.RLock() // 再次获取读锁以迭代客户端
+	h.roomsMu.RLock()                                  // 再次获取读锁以迭代客户端
 	logCtx.Debugf("向 %d 个客户端广播消息", len(roomClients)-1) // 减去发送者
 	for client := range roomClients {
 		if client != sender { // 不发送给发送者自己
@@ -300,7 +300,6 @@ func (h *Hub) broadcast(roomID uint, message []byte, sender *Client) {
 		}(clientsToUnregister)
 	}
 }
-
 
 // --- Action Processing Logic (Moved from ot.go) ---
 
@@ -526,7 +525,6 @@ func (h *Hub) runSnapshotTask() {
 			continue
 		}
 
-
 		for _, room := range rooms {
 			roomID := room.ID
 			logCtx := log.WithField("room_id", roomID)
@@ -539,7 +537,7 @@ func (h *Hub) runSnapshotTask() {
 
 			// 获取自上次快照以来的操作计数
 			opCount := getOpCountSince(ctx, roomID, currentInfo.lastSnapshotTime) // This function remains external for now
-			newInterval := calculateSnapshotInterval(opCount) // This function remains external for now
+			newInterval := calculateSnapshotInterval(opCount)                     // This function remains external for now
 
 			// 如果间隔发生变化，则更新
 			if newInterval != currentInfo.interval {
@@ -590,7 +588,6 @@ func (h *Hub) getActiveRoomIDs() []uint {
 	}
 	return ids
 }
-
 
 // --- Client Communication Logic (Moved from ws.go) ---
 
@@ -713,7 +710,7 @@ func (c *Client) writePump() {
 				logCtx.WithError(err).Error("写入消息失败")
 				// 尝试关闭 writer
 				_ = w.Close() // 忽略关闭错误，因为可能已经出错
-				return // 写入失败，退出
+				return        // 写入失败，退出
 			}
 
 			// // 优化：写入通道中的所有排队消息。
@@ -749,7 +746,6 @@ func (c *Client) writePump() {
 		}
 	}
 }
-
 
 // cleanupClients 定期检查并清理不活跃的 WebSocket 连接
 func (h *Hub) cleanupClients() {
@@ -806,7 +802,7 @@ func (h *Hub) cleanupClients() {
 			logrus.Infof("清理：准备注销 %d 个客户端。", len(clientsToUnregister))
 			for _, client := range clientsToUnregister {
 				// 关闭连接并从 Hub 注销
-				client.conn.Close()       // 关闭底层连接
+				client.conn.Close()    // 关闭底层连接
 				h.unregister <- client // 通过通道请求注销
 			}
 		}

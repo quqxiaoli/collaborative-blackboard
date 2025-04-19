@@ -4,14 +4,7 @@ import (
 	"collaborative-blackboard/config"
 	"collaborative-blackboard/models"
 	"context" // 导入 context 包
-	"crypto/rand"
-	"errors" // 导入 errors 包
-	"fmt"    // 导入 fmt 包
-	"net/http"
-	"strconv"
-	"time"
 
-	"github.com/gin-gonic/gin"
 	"crypto/rand"
 	"errors" // 导入 errors 包
 	"fmt"    // 导入 fmt 包
