@@ -24,7 +24,7 @@ type StateRepository interface {
 	GetCurrentVersion(ctx context.Context, roomID uint) (uint, error)
 
 	// IncrementVersion 原子地增加房间的版本号并返回新版本。
-	IncrementVersion(ctx context.Context, roomID uint) (uint, error) // 改为返回 uint
+	IncrementVersion(ctx context.Context, roomID uint) (uint, error) // 返回 uint
 
 	// IncrementOpCount 原子地增加房间的操作计数器。
 	IncrementOpCount(ctx context.Context, roomID uint) error
@@ -43,14 +43,19 @@ type StateRepository interface {
 	// === Snapshot Caching ===
 
 	// GetSnapshotCache 尝试从 Redis 缓存中获取快照。
+	// 如果缓存未命中，应返回 repository.ErrNotFound 或类似错误。
 	GetSnapshotCache(ctx context.Context, roomID uint) (*domain.Snapshot, error)
 
 	// SetSnapshotCache 将快照存入 Redis 缓存。
-	SetSnapshotCache(ctx context.Context, roomID uint, snapshot *domain.Snapshot) error
+	// ttlInSeconds: 缓存的生存时间（秒），0 表示不过期。
+	SetSnapshotCache(ctx context.Context, roomID uint, snapshot *domain.Snapshot, ttlInSeconds int) error // *** 包含 TTL 参数 ***
 
-    // === Rate Limiting ===
-    // CheckRateLimit 检查给定 key 的请求频率是否超限，并递增计数。
+	// === Rate Limiting ===
+	// CheckRateLimit 检查给定 key 的请求频率是否超限，并递增计数。
 	// 返回 true 如果超限，false 如果未超限。
-    CheckRateLimit(ctx context.Context, key string, limit int, duration time.Duration) (bool, error)
+	CheckRateLimit(ctx context.Context, key string, limit int, duration time.Duration) (bool, error)
 
+	// === PubSub ===
+	// PublishAction 将处理后的 Action 发布到指定房间的频道。
+	PublishAction(ctx context.Context, roomID uint, action domain.Action) error
 }

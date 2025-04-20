@@ -1,171 +1,180 @@
-package setup
+package setup // 确认包名是 setup
 
 import (
-	"collaborative-blackboard/models"
+	// 使用正确的 Domain 模型路径
+	"collaborative-blackboard/internal/domain"
 	"fmt"
 	"github.com/sirupsen/logrus"
+	"gorm.io/gorm" // 导入 gorm
 )
 
-// MigrateDB handles all database migrations
-func MigrateDB() {
-	// First, migrate the Users table with custom SQL to ensure proper index lengths
-	migrateUsersTable()
+// MigrateDB handles all database migrations using the provided GORM DB instance.
+// 返回错误以便调用者知道迁移是否成功。
+func MigrateDB(db *gorm.DB) error {
+	// 检查 db 是否为 nil
+	if db == nil {
+		return fmt.Errorf("cannot migrate database with nil DB connection")
+	}
 
-	// Also handle Room table with custom SQL for proper index lengths
-	migrateRoomsTable()
+	// 迁移 Users 表 (使用传入的 db)
+	if err := migrateUsersTable(db); err != nil {
+		return fmt.Errorf("failed to migrate users table: %w", err)
+	}
 
-	// Then use AutoMigrate for the remaining models
-	err := DB.AutoMigrate(&models.Action{}, &models.Snapshot{})
+	// 迁移 Rooms 表 (使用传入的 db)
+	if err := migrateRoomsTable(db); err != nil {
+		return fmt.Errorf("failed to migrate rooms table: %w", err)
+	}
+
+	// 使用 AutoMigrate 迁移剩余的模型 (使用传入的 db)
+	// 将 domain 包下的模型传入
+	err := db.AutoMigrate(
+		&domain.Action{},
+		&domain.Snapshot{},
+		// 确保 domain.User 和 domain.Room 结构体也包含必要的 GORM tags
+		// 如果 migrateUsersTable/migrateRoomsTable 已创建表，AutoMigrate 会尝试添加新列或索引
+		// &domain.User{}, // 通常自定义 SQL 创建后不需要再 AutoMigrate
+		// &domain.Room{}, // 通常自定义 SQL 创建后不需要再 AutoMigrate
+	)
 	if err != nil {
-		logrus.Fatal("Failed to migrate other tables: ", err)
+		logrus.Errorf("Failed to auto-migrate other tables: %v", err)
+		return fmt.Errorf("failed to auto-migrate tables: %w", err)
 	}
 
 	logrus.Info("Database migration completed successfully")
+	return nil // 迁移成功
 }
 
-// migrateUsersTable handles the Users table migration specifically
-func migrateUsersTable() {
-	// Check if the users table exists
+// migrateUsersTable 使用传入的 db 处理 Users 表迁移，并返回错误
+func migrateUsersTable(db *gorm.DB) error {
 	var count int64
-	DB.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'users'").Count(&count)
+	// 使用传入的 db
+	db.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'users'").Count(&count)
 
 	if count == 0 {
-		// Table doesn't exist - create it with proper index lengths
-		createUsersTable()
+		if err := createUsersTable(db); err != nil { // 传入 db
+			return err
+		}
 	} else {
-		// Table exists - update its structure if needed
-		updateUsersTable()
+		if err := updateUsersTable(db); err != nil { // 传入 db
+			return err
+		}
 	}
+	return nil
 }
 
-// createUsersTable creates the users table with proper index specifications
-func createUsersTable() {
+// createUsersTable 使用传入的 db 创建 users 表，并返回错误
+func createUsersTable(db *gorm.DB) error {
 	sql := `
 	CREATE TABLE users (
 		id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-		username VARCHAR(255) NOT NULL,
+		username VARCHAR(191) NOT NULL, -- 限制长度以匹配索引
 		password TEXT NOT NULL,
-		email VARCHAR(255),
+		email VARCHAR(191), -- 限制长度以匹配索引
 		created_at DATETIME(3),
 		updated_at DATETIME(3),
-		UNIQUE INDEX idx_username (username(191)),
-		UNIQUE INDEX idx_email (email(191))
+		UNIQUE INDEX idx_username (username), -- GORM 会自动处理长度，或者保持 (191)
+		UNIQUE INDEX idx_email (email)       -- GORM 会自动处理长度，或者保持 (191)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 	`
-
-	if err := DB.Exec(sql).Error; err != nil {
-		logrus.Fatal("Failed to create users table: ", err)
+	// 使用传入的 db
+	if err := db.Exec(sql).Error; err != nil {
+		logrus.Errorf("Failed to create users table: %v", err)
+		return fmt.Errorf("failed to create users table: %w", err)
 	}
-
 	logrus.Info("Users table created successfully")
+	return nil
 }
 
-// updateUsersTable modifies the existing users table to fix any issues
-func updateUsersTable() {
-	// First, check and drop existing problematic indexes
-	var indexExists int64
-	DB.Raw("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'users' AND index_name = 'idx_username'").Count(&indexExists)
-	
-	if indexExists > 0 {
-		if err := DB.Exec("DROP INDEX idx_username ON users").Error; err != nil {
-			logrus.Warn(fmt.Sprintf("Could not drop index idx_username: %v", err))
-		}
+// updateUsersTable 使用传入的 db 修改 users 表，并返回错误
+func updateUsersTable(db *gorm.DB) error {
+	// 检查并可能修改列类型或索引
+	// 使用 db.Migrator() 获取迁移器进行更安全的模式修改可能更好
+	// 例如：db.Migrator().AlterColumn(&domain.User{}, "Username")
+	// 但由于之前使用了原生 SQL，这里暂时保留，但标记为可改进
+	// TODO: Consider using db.Migrator() for safer schema updates
+
+	// 示例：确保 username 和 email 列类型正确 (如果 AutoMigrate 未处理)
+	if err := db.Exec("ALTER TABLE users MODIFY COLUMN username VARCHAR(191) NOT NULL").Error; err != nil {
+		logrus.Warnf("Could not modify username column: %v", err)
+		// 可能不是严重错误，继续
+	}
+	if err := db.Exec("ALTER TABLE users MODIFY COLUMN email VARCHAR(191)").Error; err != nil {
+		logrus.Warnf("Could not modify email column: %v", err)
 	}
 
-	DB.Raw("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'users' AND index_name = 'idx_email'").Count(&indexExists)
-	
-	if indexExists > 0 {
-		if err := DB.Exec("DROP INDEX idx_email ON users").Error; err != nil {
-			logrus.Warn(fmt.Sprintf("Could not drop index idx_email: %v", err))
-		}
+	// GORM 的 AutoMigrate 通常能处理索引的创建和更新
+	// 如果自定义 SQL 创建的索引有问题，AutoMigrate 可能失败
+	// 确保 domain.User 结构体有正确的 GORM 索引标签：
+	// type User struct {
+	//     ...
+	//     Username string `gorm:"uniqueIndex:idx_username,size:191"`
+	//     Email    string `gorm:"uniqueIndex:idx_email,size:191"`
+	// }
+	// 然后调用 AutoMigrate 处理 User 模型
+	if err := db.AutoMigrate(&domain.User{}); err != nil {
+		logrus.Errorf("Failed to auto-migrate User table for index updates: %v", err)
+		return fmt.Errorf("failed to migrate user indexes: %w", err)
 	}
 
-	// Use specific column types with proper lengths for indexed columns
-	alterTable := `
-	ALTER TABLE users 
-	MODIFY COLUMN username VARCHAR(255) NOT NULL,
-	MODIFY COLUMN email VARCHAR(255);
-	`
 
-	if err := DB.Exec(alterTable).Error; err != nil {
-		logrus.Warn(fmt.Sprintf("Error altering users table columns: %v", err))
-		// Continue anyway - the indexes are our main concern
-	}
-
-	// Re-create indexes with proper length specifications
-	createUsernameIndex := "CREATE UNIQUE INDEX idx_username ON users(username(191))"
-	if err := DB.Exec(createUsernameIndex).Error; err != nil {
-		logrus.Fatal("Failed to create username index: ", err)
-	}
-
-	createEmailIndex := "CREATE UNIQUE INDEX idx_email ON users(email(191))"
-	if err := DB.Exec(createEmailIndex).Error; err != nil {
-		logrus.Fatal("Failed to create email index: ", err)
-	}
-
-	logrus.Info("Users table indexes updated successfully")
+	logrus.Info("Users table schema checked/updated successfully")
+	return nil
 }
 
-// migrateRoomsTable handles the Rooms table migration specifically
-func migrateRoomsTable() {
-	// Check if the rooms table exists
+// migrateRoomsTable 使用传入的 db 处理 Rooms 表迁移，并返回错误
+func migrateRoomsTable(db *gorm.DB) error {
 	var count int64
-	DB.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'rooms'").Count(&count)
+	db.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'rooms'").Count(&count)
 
 	if count == 0 {
-		// Table doesn't exist - create it with proper index lengths
-		createRoomsTable()
+		if err := createRoomsTable(db); err != nil { // 传入 db
+			return err
+		}
 	} else {
-		// Table exists - update its structure if needed
-		updateRoomsTable()
+		if err := updateRoomsTable(db); err != nil { // 传入 db
+			return err
+		}
 	}
+	return nil
 }
 
-// createRoomsTable creates the rooms table with proper index specifications
-func createRoomsTable() {
+// createRoomsTable 使用传入的 db 创建 rooms 表，并返回错误
+func createRoomsTable(db *gorm.DB) error {
 	sql := `
 	CREATE TABLE rooms (
 		id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 		creator_id BIGINT UNSIGNED NOT NULL,
-		invite_code VARCHAR(255) NOT NULL,
+		invite_code VARCHAR(191) NOT NULL, -- 限制长度以匹配索引
 		created_at DATETIME(3),
 		last_active DATETIME(3),
 		updated_at DATETIME(3),
 		INDEX idx_creator_id (creator_id),
 		INDEX idx_last_active (last_active),
-		UNIQUE INDEX idx_invite_code (invite_code(191))
+		UNIQUE INDEX idx_invite_code (invite_code) -- GORM 会自动处理长度，或保持 (191)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 	`
-
-	if err := DB.Exec(sql).Error; err != nil {
-		logrus.Fatal("Failed to create rooms table: ", err)
+	if err := db.Exec(sql).Error; err != nil {
+		logrus.Errorf("Failed to create rooms table: %v", err)
+		return fmt.Errorf("failed to create rooms table: %w", err)
 	}
-
 	logrus.Info("Rooms table created successfully")
+	return nil
 }
 
-// updateRoomsTable modifies the existing rooms table to fix any issues
-func updateRoomsTable() {
-	// Check and drop existing problematic index for invite_code
-	var indexExists int64
-	DB.Raw("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'rooms' AND index_name = 'idx_invite_code'").Count(&indexExists)
-	
-	if indexExists > 0 {
-		if err := DB.Exec("DROP INDEX idx_invite_code ON rooms").Error; err != nil {
-			logrus.Warn(fmt.Sprintf("Could not drop index idx_invite_code: %v", err))
-		}
+// updateRoomsTable 使用传入的 db 修改 rooms 表，并返回错误
+func updateRoomsTable(db *gorm.DB) error {
+	// 同样，优先使用 db.Migrator() 或 AutoMigrate
+	// 确保 domain.Room 结构体有正确的 GORM 索引标签：
+	// type Room struct {
+	//     ...
+	//     InviteCode string `gorm:"uniqueIndex:idx_invite_code,size:191"`
+	// }
+	if err := db.AutoMigrate(&domain.Room{}); err != nil {
+		logrus.Errorf("Failed to auto-migrate Room table for index updates: %v", err)
+		return fmt.Errorf("failed to migrate room indexes: %w", err)
 	}
 
-	// Ensure the invite_code column uses VARCHAR instead of TEXT
-	if err := DB.Exec("ALTER TABLE rooms MODIFY invite_code VARCHAR(255) NOT NULL").Error; err != nil {
-		logrus.Warn(fmt.Sprintf("Error modifying invite_code column: %v", err))
-		// Continue anyway - we need to recreate the index
-	}
-
-	// Re-create the invite_code index with proper length
-	if err := DB.Exec("CREATE UNIQUE INDEX idx_invite_code ON rooms(invite_code(191))").Error; err != nil {
-		logrus.Fatal("Failed to create invite_code index: ", err)
-	}
-
-	logrus.Info("Rooms table indexes updated successfully")
+	logrus.Info("Rooms table schema checked/updated successfully")
+	return nil
 }

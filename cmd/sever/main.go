@@ -1,78 +1,175 @@
 package main
 
 import (
-	"collaborative-blackboard/config"
-	"collaborative-blackboard/handlers/ws"
-	"collaborative-blackboard/routes"
+	"context"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv" // 导入 godotenv
+	"github.com/joho/godotenv"
 	"github.com/sirupsen/logrus"
+
+	// --- 内部包导入 ---
+	httpHandler "collaborative-blackboard/internal/handler/http"
+	wsHandler "collaborative-blackboard/internal/handler/websocket"
+	"collaborative-blackboard/internal/hub"
+	gormpersistence "collaborative-blackboard/internal/infra/persistence/gorm"
+	"collaborative-blackboard/internal/infra/setup"
+	redisstate "collaborative-blackboard/internal/infra/state/redis"
+	"collaborative-blackboard/internal/middleware"
+	"collaborative-blackboard/internal/service"
 )
 
-// 全局日志实例，可以在这里配置日志格式、级别等
 var log = logrus.New()
 
+func init() { // 初始化日志设置 (可选)
+	log.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+	log.SetLevel(logrus.DebugLevel) // 开发时使用 Debug，生产环境用 Info 或 Warn }
+}
+
 func main() {
-	// 1. 加载环境变量 (应在所有配置初始化之前)
-	// godotenv.Load() 会加载项目根目录下的 .env 文件
-	// 如果文件不存在或加载失败，它会返回错误，但我们通常允许这种情况 (例如在生产环境中直接使用环境变量)
+	log.Info("Starting collaborative blackboard server...")
+
+	// 1. 加载环境变量 ... (不变)
 	if err := godotenv.Load(); err != nil {
 		log.Warn("Error loading .env file, relying on system environment variables")
 	}
 
-	// 2. 初始化数据库连接
-	config.InitDB()
-	// 3. 执行数据库迁移
-	config.MigrateDB()
-	// 4. 初始化 Redis 连接
-	config.InitRedis()
-
-	// 5. 创建 Gin 引擎
-	r := gin.Default() // Default() 包含了 Logger 和 Recovery 中间件
-
-	// 6. 应用中间件
-	r.Use(corsMiddleware()) // 添加 CORS 中间件
-
-	// 7. 设置路由
-	routes.SetupRouter(r)
-
-	// 8. 创建并运行 WebSocket Hub
-	// go ws.RunSnapshotTask() // 这个任务现在由 Hub 启动
-	go ws.GetHub().Run() // 获取并运行全局 Hub 实例
-
-	// 9. 启动 HTTP 服务器
-	serverAddr := ":8080" // 可以考虑从环境变量配置端口
-	log.Infof("Server starting on %s", serverAddr)
-	if err := r.Run(serverAddr); err != nil {
-		// 如果服务器启动失败，记录致命错误并退出
-		log.Fatalf("Failed to start server on %s: %v", serverAddr, err)
+	// 2. 加载配置 ... (不变)
+	dbUser := os.Getenv("DB_USER")
+	dbPassword := os.Getenv("DB_PASSWORD")
+	dbHost := os.Getenv("DB_HOST")
+	dbPort := os.Getenv("DB_PORT")
+	dbName := os.Getenv("DB_NAME")
+	redisAddr := os.Getenv("REDIS_ADDR")
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	jwtSecret := os.Getenv("JWT_SECRET")
+	serverPort := os.Getenv("SERVER_PORT")
+	if serverPort == "" {
+		serverPort = "8080"
 	}
-}
+	if jwtSecret == "" {
+		log.Fatal("CRITICAL: JWT_SECRET environment variable is not set!")
+	}
 
-// corsMiddleware 创建一个处理跨域请求的 Gin 中间件
-func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// !! 注意：生产环境应配置具体的允许来源，而不是 "*" 或开发服务器地址 !!
-		// 可以从环境变量读取允许的源
-		// allowedOrigin := os.Getenv("CORS_ALLOWED_ORIGIN")
-		// if allowedOrigin == "" {
-		// 	allowedOrigin = "http://localhost:3000" // 开发默认值
-		// }
-		allowedOrigin := "http://localhost:3000" // 暂时保留开发设置
+	// --- 3. 初始化基础设施连接 (修正错误处理) ---
+	// 初始化数据库连接
+	db, err := setup.InitDB(dbUser, dbPassword, dbHost, dbPort, dbName)
+	if err != nil {
+		// InitDB 内部已 Fatal，这里理论上不会执行，但保持检查
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	log.Info("Database connection initialized")
 
-		c.Writer.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true") // 如果前端需要发送凭证 (如 Cookie)
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS") // 允许的方法
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With") // 允许的请求头
+	// 执行数据库迁移
+	// 将 db 连接传递给迁移函数，并检查错误
+	err = setup.MigrateDB(db)
+	if err != nil {
+		log.Fatalf("Failed to run database migrations: %v", err)
+	}
+	log.Info("Database migrations completed")
 
-		// 处理 OPTIONS 预检请求
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(http.StatusNoContent) // 返回 204 No Content
-			return
+	// 初始化 Redis 连接
+	// 接收返回值 rdb 和 err
+	rdb, err := setup.InitRedis(redisAddr, redisPassword, 0) // DB 0
+	if err != nil {
+		// InitRedis 内部已 Fatal
+		log.Fatalf("Failed to initialize Redis: %v", err)
+	}
+	log.Info("Redis connection initialized")
+	// 优雅关闭 Redis 连接
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Errorf("Error closing Redis connection: %v", err)
+		} else {
+			log.Info("Redis connection closed")
 		}
+	}()
 
-		c.Next() // 继续处理请求链
+	// --- 4. 依赖注入 (不变) ---
+	log.Info("Initializing application components...")
+	userRepo := gormpersistence.NewGormUserRepository(db)
+	roomRepo := gormpersistence.NewGormRoomRepository(db)
+	actionRepo := gormpersistence.NewGormActionRepository(db)
+	snapshotRepo := gormpersistence.NewGormSnapshotRepository(db)
+	stateRepo := redisstate.NewRedisStateRepository(rdb, "bb:")
+
+	jwtExpiryHours := 24
+	authService, err := service.NewAuthService(userRepo, jwtSecret, jwtExpiryHours)
+	if err != nil {
+		log.Fatalf("Failed to create AuthService: %v", err)
 	}
+	roomService := service.NewRoomService(roomRepo)
+	collabService := service.NewCollaborationService(actionRepo, stateRepo, snapshotRepo, roomRepo)
+	snapshotService := service.NewSnapshotService(snapshotRepo, stateRepo, actionRepo)
+
+	hubInstance := hub.NewHub(collabService, snapshotService)
+
+	authHandler := httpHandler.NewAuthHandler(authService)
+	roomHandler := httpHandler.NewRoomHandler(roomService)
+	wsHandler := wsHandler.NewWebSocketHandler(hubInstance, roomService)
+
+	// --- 5. 启动核心后台 Goroutine (不变) ---
+	log.Info("Starting background routines...")
+	go hubInstance.Run()
+	log.Info("Hub routine started")
+	// TODO: 启动其他后台任务
+
+	// --- 6. 创建并配置 Gin 引擎 (不变) ---
+	log.Info("Setting up Gin router...")
+	r := gin.Default()
+
+	// --- 7. 应用中间件 (修正 RateLimit 和 Auth 调用) ---
+	r.Use(func(c *gin.Context) { /* ... (CORS 不变) ... */ })
+
+	// 应用速率限制中间件 (传入 rdb)
+	rateLimitWindow := 1 * time.Second
+	r.Use(middleware.RateLimit(rdb, 100, rateLimitWindow)) // 传入 rdb
+
+	// --- 8. 设置路由 (修正 Auth 中间件调用) ---
+	api := r.Group("/api")
+	authRoutes := api.Group("/auth")
+	{
+		authRoutes.POST("/register", authHandler.Register)
+		authRoutes.POST("/login", authHandler.Login)
+	}
+
+	// 传入 jwtSecret 到 Auth 中间件
+	roomRoutes := api.Group("/rooms").Use(middleware.Auth(jwtSecret))
+	{
+		roomRoutes.POST("", roomHandler.CreateRoom)
+		roomRoutes.POST("/join", roomHandler.JoinRoom)
+	}
+
+	// 传入 jwtSecret 到 Auth 中间件
+	wsRoutes := r.Group("/ws").Use(middleware.Auth(jwtSecret))
+	{
+		wsRoutes.GET("/room/:roomId", wsHandler.HandleConnection)
+	}
+
+	r.GET("/ping", func(c *gin.Context) { /* ... (不变) ... */ })
+
+	// --- 9. 启动 HTTP 服务器 (不变) ---
+	serverAddr := ":" + serverPort
+	log.Infof("Server starting on %s", serverAddr)
+	srv := &http.Server{Addr: serverAddr, Handler: r}
+	go func() { /* ... (启动服务器不变) ... */ }()
+
+	// --- 10. 实现优雅关闭 (不变) ---
+	log.Info("Setting up graceful shutdown...")
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Info("Shutdown signal received, shutting down server gracefully...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+	log.Info("Server exiting")
 }

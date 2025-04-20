@@ -1,119 +1,86 @@
-package setup
+package setup // 确认包名是 setup
 
 import (
 	"context"
-	"os"
+	"fmt"
 	"time"
 
+	// 使用正确的 Domain 模型路径 (如果迁移需要)
+	// "collaborative-blackboard/internal/domain"
+
 	"github.com/go-redis/redis/v8"
-	"fmt" // 导入 fmt 包用于错误格式化
 	"github.com/sirupsen/logrus"
-	"gorm.io/driver/mysql"
+	"gorm.io/driver/mysql" // 假设使用 MySQL
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger" // 用于配置 GORM 日志
 )
 
-var DB *gorm.DB     // DB 是全局数据库连接实例
-var Redis *redis.Client // Redis 是全局 Redis 客户端实例
+// 全局变量 DB 和 Redis 不再需要在这里定义和赋值
+// var DB *gorm.DB
+// var Redis *redis.Client
 
-// InitDB 初始化数据库连接
-func InitDB() {
-	// .env 文件通常在 main 函数开始时加载一次即可
-	// err := godotenv.Load()
-	// if err != nil {
-	// 	logrus.Warn("Error loading .env file, using environment variables directly")
-	// }
-
-	dsn, err := getDSN() // 获取数据库连接字符串
-	if err != nil {
-		logrus.Fatal("Failed to get DSN: ", err) // 如果无法构建 DSN，则程序无法继续
-	}
-
-	var errDB error
-	DB, errDB = gorm.Open(mysql.Open(dsn), &gorm.Config{}) // 连接数据库
-	if errDB != nil {
-		logrus.Fatal("Failed to connect to MySQL: ", errDB) // 注意这里应该用 errDB
-	}
-
-	sqlDB, err := DB.DB() // 获取底层的 *sql.DB 对象
-	if err != nil {
-		logrus.Fatal("Failed to get underlying sql.DB: ", err) // 添加错误检查
-	}
-	sqlDB.SetMaxOpenConns(50)
-	sqlDB.SetMaxIdleConns(10)
-	sqlDB.SetConnMaxLifetime(30 * time.Minute)
-	logrus.Info("MySQL connected")             // 记录数据库连接成功信息
-}
-
-// getDSN 从环境变量构建数据库连接字符串 (DSN)
-// 返回 DSN 字符串和可能的错误
-func getDSN() (string, error) {
-	mysqlUser := os.Getenv("MYSQL_USER")
-	if mysqlUser == "" {
-		// 如果环境变量未设置，应该返回错误
-		return "", fmt.Errorf("MYSQL_USER environment variable not set")
-	}
-	mysqlPassword := os.Getenv("MYSQL_PASSWORD")
-	if mysqlPassword == "" {
-		// !!! 安全警告：绝不应在代码中硬编码密码或设置不安全的默认值 !!!
-		// 如果环境变量未设置，应该返回错误，强制要求配置。
-		return "", fmt.Errorf("MYSQL_PASSWORD environment variable not set")
-	}
-	mysqlHost := os.Getenv("MYSQL_HOST")
-	if mysqlHost == "" {
-		mysqlHost = "127.0.0.1" // 可以保留本地开发默认值，但生产环境应显式设置
-	}
-	mysqlPort := os.Getenv("MYSQL_PORT")
-	if mysqlPort == "" {
-		mysqlPort = "3306"
-	}
-	mysqlDB := os.Getenv("MYSQL_DB")
-	if mysqlDB == "" {
-		mysqlDB = "blackboard_db" // 可以保留本地开发默认值
-	}
-	// 构建 DSN 字符串
+// InitDB 初始化数据库连接并返回 GORM DB 实例和错误
+func InitDB(user, password, host, port, dbname string) (*gorm.DB, error) {
+	// 构建 DSN (Data Source Name)
+	// 注意：参数需要根据实际情况调整，例如 charset, parseTime 等
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-		mysqlUser, mysqlPassword, mysqlHost, mysqlPort, mysqlDB)
-	return dsn, nil // 返回构建好的 DSN 和 nil 错误
-}
+		user, password, host, port, dbname)
 
-// MigrateDB 自动迁移数据库模式 
-// 注意：此函数现在由 migrations.go 中的同名函数替代，它使用自定义 SQL 来处理用户表的迁移
-// 这解决了 TEXT/BLOB 列需要指定索引长度的问题
-// func MigrateDB() {
-// 	// 自动迁移 User, Room, Action, Snapshot 模型对应的表结构
-// 	err := DB.AutoMigrate(&models.User{}, &models.Room{}, &models.Action{}, &models.Snapshot{})
-// 	if err != nil {
-// 		logrus.Fatal("Failed to migrate database: ", err) // 迁移失败是严重问题
-// 	}
-// 	logrus.Info("Database migrated") // 记录数据库迁移成功信息
-// }
+	// 配置 GORM 日志级别
+	gormLogger := logger.New(
+		logrus.StandardLogger(), // 使用 logrus 作为日志输出
+		logger.Config{
+			SlowThreshold:             time.Second, // 慢 SQL 阈值
+			LogLevel:                  logger.Warn, // 日志级别 (Warn, Error, Info, Silent)
+			IgnoreRecordNotFoundError: true,        // 忽略 ErrRecordNotFound 错误
+			Colorful:                  false,       // 是否启用彩色打印
+		},
+	)
 
-// InitRedis 初始化 Redis 连接
-func InitRedis() {
-	// .env 文件通常在 main 函数开始时加载一次即可
-	// err := godotenv.Load()
-	// if err != nil {
-	// 	logrus.Warn("Error loading .env file, using environment variables directly")
-	// }
-	redisHost := os.Getenv("REDIS_HOST")
-	if redisHost == "" {
-		redisHost = "127.0.0.1" // 本地开发默认值
-	}
-	redisPort := os.Getenv("REDIS_PORT")
-	if redisPort == "" {
-		redisPort = "6379"
-	}
-	Redis = redis.NewClient(&redis.Options{
-		Addr:         redisHost + ":" + redisPort,
-		Password:     os.Getenv("REDIS_PASSWORD"),
-		DB:           0,
-		PoolSize:     20,
-		MinIdleConns: 5,
-		MaxConnAge:   30 * time.Minute,      // 连接最大存活时间
+	// 连接数据库
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: gormLogger, // 设置日志记录器
+		// 可以添加其他 GORM 配置
 	})
-	// 使用后台上下文测试 Redis 连接
-	if _, err := Redis.Ping(context.Background()).Result(); err != nil {
-		logrus.Fatal("Failed to connect to Redis: ", err) // Redis 连接失败是严重问题
+
+	if err != nil {
+		// 连接失败，返回错误
+		logrus.WithError(err).Fatal("Failed to connect to database")
+		return nil, fmt.Errorf("failed to connect database: %w", err)
 	}
-	logrus.Info("Redis connected") // 记录 Redis 连接成功信息
+
+	logrus.Info("Database connection established")
+	// 返回连接实例
+	return db, nil
 }
+
+// InitRedis 初始化 Redis 连接并返回 Redis 客户端实例和错误
+func InitRedis(addr, password string, db int) (*redis.Client, error) {
+	// 创建 Redis 客户端选项
+	opts := &redis.Options{
+		Addr:     addr,     // Redis 服务器地址和端口 (e.g., "localhost:6379")
+		Password: password, // Redis 密码 (如果没有则为空字符串)
+		DB:       db,       // 使用的 Redis 数据库编号 (默认 0)
+	}
+
+	// 创建 Redis 客户端
+	client := redis.NewClient(opts)
+
+	// 测试连接 (Ping)
+	// 使用 context 设置超时
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := client.Ping(ctx).Result()
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to connect to Redis")
+		return nil, fmt.Errorf("failed to connect redis: %w", err)
+	}
+
+	logrus.Info("Redis connection established")
+	// 返回客户端实例
+	return client, nil
+}
+
+// MigrateDB 函数现在移动到 migrations.go 中，并接收 *gorm.DB 参数
+// func MigrateDB() { ... }
