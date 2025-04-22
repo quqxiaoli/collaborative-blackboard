@@ -9,7 +9,10 @@ import (
 	// 导入正确的路径
 	//"collaborative-blackboard/internal/domain" // 需要 domain.Snapshot 等
 	"collaborative-blackboard/internal/service"
-
+	//"collaborative-blackboard/internal/repository"
+	"collaborative-blackboard/internal/tasks" // 导入任务定义包
+	// 导入 Asynq Client 和 Task 相关
+	"github.com/hibiken/asynq"
 	//"github.com/gorilla/websocket" // 需要导入以在 client.go 中使用（虽然这里没直接用）
 	"github.com/sirupsen/logrus"
 )
@@ -44,6 +47,9 @@ type Hub struct {
 	// 内部通道，处理所有来自 Client 的事件
 	messageChan chan HubMessage
 
+	// 新增: Asynq Client 用于将任务入队
+	asynqClient *asynq.Client
+
 	// 客户端集合，按 RoomID 组织
 	// map[roomID]map[*Client]bool
 	rooms map[uint]map[*Client]bool
@@ -56,7 +62,7 @@ type Hub struct {
 }
 
 // NewHub 创建并返回一个新的 Hub 实例
-func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService) *Hub {
+func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client) *Hub {
 	// 启动时检查依赖注入是否有效
 	if collabService == nil {
 		panic("CollaborationService cannot be nil for Hub")
@@ -64,9 +70,11 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 	if snapshotService == nil {
 		panic("SnapshotService cannot be nil for Hub")
 	}
+	if asynqClient == nil { panic("Asynq Client cannot be nil for Hub") } // 检查依赖
 	return &Hub{
 		// 创建带缓冲区的通道，大小可根据预期负载调整
 		messageChan:   make(chan HubMessage, 512),
+		asynqClient:     asynqClient, // 存储注入的 client
 		rooms:         make(map[uint]map[*Client]bool),
 		collabService: collabService,
 		snapshotService: snapshotService,
@@ -100,7 +108,11 @@ func (h *Hub) Run() {
 	}
 	// 当 messageChan 关闭时，循环结束
 	log.Info("Hub is shutting down...")
+	// Hub 关闭时，可能需要关闭 asynqClient (如果 Hub 创建了它的话，但通常 Client 是共享的)
+	// h.asynqClient.Close()
 }
+
+
 
 // registerClient 处理客户端注册逻辑
 func (h *Hub) registerClient(client *Client) {
@@ -266,10 +278,29 @@ func (h *Hub) handleClientAction(msg HubMessage) {
 		// 调用广播方法，排除发送者 (msg.Client)
 		h.broadcast(msg.RoomID, broadcastMsgBytes, msg.Client)
 
-		// TODO: 触发 Action 的数据库持久化 (移至后台任务)
-		// 例如: taskqueue.EnqueueSaveAction(ctx, *processedAction)
-		// logCtx.Debug("Triggering background action persistence")
+		// --- 修改：使用 Asynq 将持久化任务入队 ---
+		// 1. 创建任务 Payload
+		taskPayloadBytes, err := tasks.NewActionPersistenceTask(*processedAction)
+		if err != nil {
+			logCtx.WithError(err).Error("Failed to create action persistence task payload")
+			// 错误处理：记录日志，可能需要告警
+			return // 暂时不入队
+		}
 
+		// 2. 创建 Asynq 任务
+		// 第一个参数是任务类型，第二个是序列化后的 payload
+		// 可以添加选项，如 asynq.MaxRetry(5), asynq.Timeout(1*time.Minute) 等
+		task := asynq.NewTask(tasks.TypeActionPersistence, taskPayloadBytes)
+
+		// 3. 将任务入队 (使用注入的 asynqClient)
+		// EnqueueContext 是推荐的方法，可以传递上下文用于追踪等
+		taskInfo, err := h.asynqClient.EnqueueContext(ctx, task)
+		if err != nil {
+			logCtx.WithError(err).Error("Failed to enqueue action persistence task")
+			// 错误处理：记录日志，告警，可能需要重试或死信队列策略（虽然 Asynq 会处理重试）
+		} else {
+			logCtx.WithField("task_id", taskInfo.ID).WithField("queue", taskInfo.Queue).Debug("Action persistence task enqueued successfully")
+		}
 	} else {
 		logCtx.Debug("Action processed but no broadcast needed (e.g., noop or error)")
 	}

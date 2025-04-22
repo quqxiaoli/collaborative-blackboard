@@ -6,8 +6,8 @@ import (
 	"strconv"
 
 	// 导入 Service, Hub, Client 定义
-	"collaborative-blackboard/internal/hub"      // 导入 Hub 包
-	"collaborative-blackboard/internal/service"  // 导入 Service 包
+	"collaborative-blackboard/internal/hub"     // 导入 Hub 包
+	"collaborative-blackboard/internal/service" // 导入 Service 包
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket" // 导入 websocket 库
@@ -16,8 +16,8 @@ import (
 
 // WebSocketHandler 负责处理 WebSocket 升级请求和客户端注册
 type WebSocketHandler struct {
-	upgrader    websocket.Upgrader // WebSocket 升级器
-	hub         *hub.Hub           // 依赖 Hub
+	upgrader    websocket.Upgrader   // WebSocket 升级器
+	hub         *hub.Hub             // 依赖 Hub
 	roomService *service.RoomService // 依赖 RoomService 验证房间
 }
 
@@ -112,28 +112,28 @@ func (h *WebSocketHandler) HandleConnection(c *gin.Context) {
 	client := hub.NewClient(h.hub, conn, roomID, userID) // 假设 Hub 包提供了 NewClient 函数
 
 	registerMsg := hub.HubMessage{
-        Type:   "register",
-        Client: client,
-        RoomID: client.RoomID(),
-        UserID: client.UserID(),
-    }
-    // 使用 Hub 的公共方法 QueueMessage 发送注册请求
-    if !h.hub.QueueMessage(registerMsg) { // *** 使用 QueueMessage ***
-        // Hub 的通道满了，注册失败
-        logCtx.Error("WS Handler: Hub message channel full, failed to register client")
-        client.CloseConn() // 关闭连接
-        // 可以考虑返回 HTTP 错误，但连接已升级，意义不大
-        return
-    }
-    logCtx.Info("WS Handler: Client registration request queued to Hub")
+		Type:   "register",
+		Client: client,
+		RoomID: client.RoomID(),
+		UserID: client.UserID(),
+	}
+	// 使用 Hub 的公共方法 QueueMessage 发送注册请求
+	if !h.hub.QueueMessage(registerMsg) { // *** 使用 QueueMessage ***
+		// Hub 的通道满了，注册失败
+		logCtx.Error("WS Handler: Hub message channel full, failed to register client")
+		client.CloseConn() // 关闭连接
+		// 可以考虑返回 HTTP 错误，但连接已升级，意义不大
+		return
+	}
+	logCtx.Info("WS Handler: Client registration request queued to Hub")
 
 	// 7. 启动客户端的读写 Goroutine (这里也需要修改)
-    // 我们需要将启动 goroutine 的调用移到 Client 对象本身的方法中，
-    // 或者确保 Hub 在处理完 "register" 消息后启动它们。
-    // 暂时先注释掉这里的启动，因为之前的报错显示 ReadPump 未导出。
+	// 我们需要将启动 goroutine 的调用移到 Client 对象本身的方法中，
+	// 或者确保 Hub 在处理完 "register" 消息后启动它们。
+	// 暂时先注释掉这里的启动，因为之前的报错显示 ReadPump 未导出。
 
-    // *** 或者更好的方式：让 Client 自己启动 ***
-    go client.Run() // 假设 Client 有一个 Run 方法来启动 readPump 和 writePump
+	// *** 或者更好的方式：让 Client 自己启动 ***
+	go client.Run() // 假设 Client 有一个 Run 方法来启动 readPump 和 writePump
 
 	logCtx.Info("WS Handler: Client read/write pumps started")
 	// 注意：一旦启动了 goroutine，这个 HandleConnection 函数就结束了。

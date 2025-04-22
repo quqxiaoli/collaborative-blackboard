@@ -19,8 +19,9 @@ import (
 type CollaborationService struct {
 	actionRepo   repository.ActionRepository   // 用于计划的后台持久化
 	stateRepo    repository.StateRepository    // 读写 Redis 状态/缓存/历史/PubSub
-	snapshotRepo repository.SnapshotRepository // 读写 DB 快照 (供 SnapshotService 使用?)
-	roomRepo     repository.RoomRepository     // 获取房间信息 (供 SnapshotService 使用?)
+	//snapshotRepo repository.SnapshotRepository // 读写 DB 快照 
+	//roomRepo     repository.RoomRepository     // 获取房间信息 
+	//快照逻辑移到和DB持久化已移出，不需要这两个Repo了
 	// pubsubRepo repository.PubSubRepository // 如果将发布进一步抽象
 	// otTransformer *ot.Transformer
 }
@@ -29,19 +30,19 @@ type CollaborationService struct {
 func NewCollaborationService(
 	actionRepo repository.ActionRepository,
 	stateRepo repository.StateRepository,
-	snapshotRepo repository.SnapshotRepository, // *** 恢复参数 ***
-	roomRepo repository.RoomRepository,     // *** 恢复参数 ***
+	//snapshotRepo repository.SnapshotRepository, // *** 恢复参数 ***
+	//roomRepo repository.RoomRepository,     // *** 恢复参数 ***
 	// pubsubRepo repository.PubSubRepository,
 ) *CollaborationService {
 	// 添加 nil 检查
-	if actionRepo == nil || stateRepo == nil || snapshotRepo == nil || roomRepo == nil {
+	if actionRepo == nil || stateRepo == nil  {
 		panic("All repositories must be non-nil for CollaborationService")
 	}
 	return &CollaborationService{
 		actionRepo:   actionRepo,
 		stateRepo:    stateRepo,
-		snapshotRepo: snapshotRepo, // *** 赋值 ***
-		roomRepo:     roomRepo,     // *** 赋值 ***
+		//snapshotRepo: snapshotRepo, // *** 赋值 ***
+		//roomRepo:     roomRepo,     // *** 赋值 ***
 		// pubsubRepo: pubsubRepo,
 	}
 }
@@ -90,7 +91,7 @@ func (s *CollaborationService) ProcessIncomingAction(ctx context.Context, roomID
 		logCtx.Debug("Action not noop, applying state update")
 		shouldBroadcastAndPersist = true // 标记需要广播和持久化
 
-		// 5a. 更新 Redis 状态 (调用 Repository 接口 - 使用 UpdateBoardState)
+		// 5a. 更新 Redis 状态 (调用 Repository 接口 - 使用 ApplyActionToState)
 		if err := s.stateRepo.ApplyActionToState(ctx, roomID, finalAction); err != nil { // *** 修正方法名 ***
 			logCtx.WithError(err).Error("Failed to update board state in repository")
 			// 关键步骤失败，可以考虑是否仍要广播（可能导致不一致）或返回错误
@@ -112,21 +113,15 @@ func (s *CollaborationService) ProcessIncomingAction(ctx context.Context, roomID
 			// 记录错误
 		}
 
-		// 5d. [触发] 发布 Action 到 PubSub (调用 Repository)
-		// 将发布操作移到 Service 层，因为这是业务流程的一部分
-		if err := s.stateRepo.PushActionToHistory(ctx, roomID, finalAction); err != nil {
+		// 5d. **直接发布** Action 到 Redis Pub/Sub (用于广播)
+		if err := s.stateRepo.PublishAction(ctx, roomID, finalAction); err != nil {
 			logCtx.WithError(err).Error("Failed to publish action via repository")
-			// 发布失败是严重问题，可能导致客户端不同步
-			// 可以考虑返回错误或重试
-			// 暂时仅记录
+			// 发布失败是严重问题，记录下来，可能需要监控
 		} else {
-			logCtx.Debug("Action published successfully")
+			logCtx.Debug("Action published successfully via repository")
 		}
-
-		// 5e: 持久化 Action 到 DB 的触发留给调用者 (Hub 或后台任务)
-
 	} else {
-		logCtx.Debug("Action transformed to noop")
+			logCtx.Debug("Action transformed to noop")
 	}
 
 	// 返回最终的 Action (可能是 noop) 和是否需要广播/持久化的标志
