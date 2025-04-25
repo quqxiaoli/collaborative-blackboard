@@ -2,7 +2,7 @@ package bootstrap
 
 import (
 	"context"
-	"errors"
+	"errors" // 导入 errors 包
 	"fmt"
 	"net/http"
 	"os"
@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8" // 导入 redis
 	"github.com/hibiken/asynq"
 	"github.com/joho/godotenv"
 	"github.com/sirupsen/logrus"
+	"gorm.io/gorm" // 导入 gorm
 
 	// --- 导入内部包 ---
 	httpHandler "collaborative-blackboard/internal/handler/http"
@@ -22,75 +24,73 @@ import (
 	"collaborative-blackboard/internal/infra/setup"
 	redisstate "collaborative-blackboard/internal/infra/state/redis"
 	"collaborative-blackboard/internal/middleware"
-
-	//"collaborative-blackboard/internal/repository" // 需要导入 repository
+	//"collaborative-blackboard/internal/repository" 
 	"collaborative-blackboard/internal/service"
 	"collaborative-blackboard/internal/worker"
-
-	"github.com/go-redis/redis/v8" // 需要导入 redis
-	"gorm.io/gorm"                 // 需要导入 gorm
 )
 
 // Config 结构体用于存储从环境变量或文件加载的配置
 type Config struct {
-	DBUser         string
-	DBPassword     string
-	DBHost         string
-	DBPort         string
-	DBName         string
-	RedisAddr      string
-	RedisPassword  string
-	RedisDB        int
-	JWTSecret      string
-	ServerPort     string
-	LogLevel       string // 例如 "debug", "info", "warn"
-	// 可以添加更多配置项...
-	RateLimitMax   int
+	DBUser          string
+	DBPassword      string
+	DBHost          string
+	DBPort          string
+	DBName          string
+	RedisAddr       string
+	RedisPassword   string
+	RedisDB         int
+	JWTSecret       string
+	ServerPort      string
+	LogLevel        string
+	RateLimitMax    int
 	RateLimitWindow time.Duration
-    JWTExpiryHours int
+	JWTExpiryHours  int
+	AppEnv          string // 新增: 应用环境 (development/production)
+	KeyPrefix       string // 新增: Redis Key 前缀
 }
 
 // LoadConfig 从环境变量加载配置
 func LoadConfig() (*Config, error) {
-	if err := godotenv.Load(); err != nil {
-		logrus.Warn("Error loading .env file, relying on system environment variables")
-	}
+	// 优先加载 .env 文件 (如果存在)
+	_ = godotenv.Load() // 忽略错误，允许只使用环境变量
 
 	cfg := &Config{
-		DBUser:         os.Getenv("DB_USER"),
-		DBPassword:     os.Getenv("DB_PASSWORD"),
-		DBHost:         os.Getenv("DB_HOST"),
-		DBPort:         os.Getenv("DB_PORT"),
-		DBName:         os.Getenv("DB_NAME"),
-		RedisAddr:      os.Getenv("REDIS_ADDR"),
-		RedisPassword:  os.Getenv("REDIS_PASSWORD"),
-		JWTSecret:      os.Getenv("JWT_SECRET"),
-		ServerPort:     os.Getenv("SERVER_PORT"),
-		LogLevel:       os.Getenv("LOG_LEVEL"),
-        RateLimitMax:   100, // 默认值
-        RateLimitWindow: 1 * time.Second, // 默认值
-        JWTExpiryHours: 24, // 默认值
+		DBUser:          os.Getenv("DB_USER"),
+		DBPassword:      os.Getenv("DB_PASSWORD"),
+		DBHost:          os.Getenv("DB_HOST"),
+		DBPort:          os.Getenv("DB_PORT"),
+		DBName:          os.Getenv("DB_NAME"),
+		RedisAddr:       os.Getenv("REDIS_ADDR"),
+		RedisPassword:   os.Getenv("REDIS_PASSWORD"),
+		JWTSecret:       os.Getenv("JWT_SECRET"),
+		ServerPort:      os.Getenv("SERVER_PORT"),
+		LogLevel:        os.Getenv("LOG_LEVEL"),
+		AppEnv:          os.Getenv("APP_ENV"),
+		KeyPrefix:       os.Getenv("REDIS_KEY_PREFIX"),
+		// --- 设置默认值 ---
+		RateLimitMax:    100,
+		RateLimitWindow: 1 * time.Second,
+		JWTExpiryHours:  24,
 	}
 
-    // 处理 Redis DB
-    redisDBStr := os.Getenv("REDIS_DB")
-    cfg.RedisDB, _ = strconv.Atoi(redisDBStr) // 忽略错误，默认为 0
+	// 处理 Redis DB
+	redisDBStr := os.Getenv("REDIS_DB")
+	cfg.RedisDB, _ = strconv.Atoi(redisDBStr) // 忽略错误，默认为 0
 
-    // 设置默认值和进行必要检查
+	// --- 设置其他默认值和进行必要检查 ---
 	if cfg.ServerPort == "" { cfg.ServerPort = "8080" }
 	if cfg.LogLevel == "" { cfg.LogLevel = "info" }
-    if cfg.RedisAddr == "" { return nil, fmt.Errorf("REDIS_ADDR must be set") }
-    if cfg.JWTSecret == "" { return nil, fmt.Errorf("JWT_SECRET must be set") }
-    // 可以添加更多验证...
+	if cfg.AppEnv == "" { cfg.AppEnv = "development" } // 默认开发环境
+	if cfg.KeyPrefix == "" { cfg.KeyPrefix = "bb:" } // 默认 key 前缀
+	if cfg.RedisAddr == "" { return nil, fmt.Errorf("environment variable REDIS_ADDR must be set") }
+	if cfg.JWTSecret == "" { return nil, fmt.Errorf("environment variable JWT_SECRET must be set") }
+	// 可以添加数据库配置的检查
 
-	// 解析日志级别
-	level, err := logrus.ParseLevel(cfg.LogLevel)
-	if err != nil {
+	// 验证日志级别
+	if _, err := logrus.ParseLevel(cfg.LogLevel); err != nil {
 		logrus.Warnf("Invalid LOG_LEVEL '%s', using default 'info'", cfg.LogLevel)
-		cfg.LogLevel = "info"//将配置中的字符串修正为有效的默认值 "info"
-		level = logrus.InfoLevel// 将要设置的级别常量也设为默认 InfoLevel
+		cfg.LogLevel = "info" // 修正配置值
 	}
-	logrus.SetLevel(level) // 设置全局日志级别
 
 	return cfg, nil
 }
@@ -102,25 +102,38 @@ type App struct {
 	DB           *gorm.DB
 	RedisClient  *redis.Client
 	AsynqClient  *asynq.Client
-	AsynqServer  *worker.WorkerServer // 使用封装后的 WorkerServer
+	AsynqServer  *worker.WorkerServer
 	Hub          *hub.Hub
 	HttpServer   *http.Server
-	// 可以添加其他需要的组件...
+	// 可以存储其他组件以便 Shutdown 时访问，或者仅在 NewApp 中使用
+	// actionRepo   repository.ActionRepository
 }
 
 // NewApp 创建并初始化应用的所有组件
 func NewApp() (*App, error) {
-	log := logrus.New() // 创建一个新的 logger 实例给 App
-	log.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-
 	// 1. 加载配置
 	cfg, err := LoadConfig()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
+		// 使用标准 log 记录启动时错误，因为 logrus 可能还未完全配置
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		return nil, err // 返回错误
 	}
-	log.Info("Configuration loaded") // 这条日志会根据 LoadConfig 设置的全局级别输出
 
-	// 2. 初始化基础设施
+	// 2. 初始化 Logger
+	log := logrus.New()
+	if cfg.AppEnv == "production" {
+		log.SetFormatter(&logrus.JSONFormatter{TimestampFormat: time.RFC3339Nano})
+	} else {
+		log.SetFormatter(&logrus.TextFormatter{FullTimestamp: true, ForceColors: true})
+	}
+	logLevel, _ := logrus.ParseLevel(cfg.LogLevel) // cfg.LogLevel 已被 LoadConfig 验证
+	log.SetLevel(logLevel)
+	log.SetOutput(os.Stdout) // 或 os.Stderr
+	log.Infof("Logger initialized (Level: %s, Format: %T)", logLevel.String(), log.Formatter)
+	log.Info("Configuration loaded successfully")
+
+	// 3. 初始化基础设施
+	log.Info("Initializing infrastructure...")
 	db, err := setup.InitDB(cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName)
 	if err != nil { return nil, fmt.Errorf("failed to init DB: %w", err) }
 	log.Info("Database initialized")
@@ -140,49 +153,69 @@ func NewApp() (*App, error) {
 	}
 	asynqClient := asynq.NewClient(redisClientOpt)
 	log.Info("Asynq client initialized")
+	log.Info("Infrastructure initialized successfully")
 
-	// 3. 初始化 Repositories
+	// 4. 初始化 Repositories
+	log.Info("Initializing repositories...")
 	userRepo := gormpersistence.NewGormUserRepository(db)
 	roomRepo := gormpersistence.NewGormRoomRepository(db)
-	actionRepo := gormpersistence.NewGormActionRepository(db) // 需要 actionRepo 给 worker
+	actionRepo := gormpersistence.NewGormActionRepository(db)
 	snapshotRepo := gormpersistence.NewGormSnapshotRepository(db)
-	stateRepo := redisstate.NewRedisStateRepository(redisClient, "bb:") // 使用 redisClient
+	stateRepo := redisstate.NewRedisStateRepository(redisClient, cfg.KeyPrefix) // 使用配置的前缀
+	log.Info("Repositories initialized")
 
-	// 4. 初始化 Services
+	// 5. 初始化 Services
+	log.Info("Initializing services...")
 	authService, err := service.NewAuthService(userRepo, cfg.JWTSecret, cfg.JWTExpiryHours)
 	if err != nil { return nil, fmt.Errorf("failed to create AuthService: %w", err) }
 	roomService := service.NewRoomService(roomRepo)
+	// 注意：确保 Service 的依赖是最新的
 	collabService := service.NewCollaborationService(actionRepo, stateRepo)
 	snapshotService := service.NewSnapshotService(snapshotRepo, stateRepo, actionRepo)
+	log.Info("Services initialized")
 
-	// 5. 初始化 Hub
-	hubInstance := hub.NewHub(collabService, snapshotService, asynqClient)
+	// 6. 初始化 Hub (注入 Redis Client 和 Prefix)
+	log.Info("Initializing hub...")
+	hubInstance := hub.NewHub(collabService, snapshotService, asynqClient, redisClient, cfg.KeyPrefix)
+	log.Info("Hub initialized")
 
-	// 6. 初始化 Handlers
+	// 7. 初始化 Handlers
+	log.Info("Initializing handlers...")
 	authHandler := httpHandler.NewAuthHandler(authService)
 	roomHandler := httpHandler.NewRoomHandler(roomService)
 	wsHandler := wsHandler.NewWebSocketHandler(hubInstance, roomService)
+	log.Info("Handlers initialized")
 
-    // 7. 初始化 Worker Server
-    workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, log) // 将 actionRepo 注入
+	// 8. 初始化 Worker Server
+	log.Info("Initializing worker server...")
+	workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, log)
+	log.Info("Worker server initialized")
 
+	// 9. 初始化 Gin Engine 和路由
+	log.Info("Setting up Gin router...")
+	if cfg.AppEnv == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	} else {
+		gin.SetMode(gin.DebugMode)
+	}
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.Use(LoggerMiddleware(log)) // 使用 App 的 logger
 
-	// 8. 初始化 Gin Engine 和路由
-	gin.SetMode(gin.ReleaseMode) // 根据环境设置模式
-	router := gin.New()          // 使用 New() 而不是 Default() 以便自定义中间件
-	router.Use(gin.Recovery())   // 添加 Recovery 中间件
-	router.Use(LoggerMiddleware(log)) // 添加自定义的 Logger 中间件 (见下文)
 	// --- 应用其他中间件 ---
 	router.Use(func(c *gin.Context) { /* CORS */
-        allowedOrigin := "http://localhost:3000" // TODO: 从配置读取
-        c.Writer.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+		allowedOrigin := os.Getenv("CORS_ALLOWED_ORIGIN") // 从环境变量读取
+		if allowedOrigin == "" {
+			allowedOrigin = "http://localhost:3000" // 开发默认
+		}
+		c.Writer.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 		if c.Request.Method == "OPTIONS" { c.AbortWithStatus(http.StatusNoContent); return }
 		c.Next()
-    })
-	router.Use(middleware.RateLimit(redisClient, cfg.RateLimitMax, cfg.RateLimitWindow)) // 注入 redisClient
+	})
+	router.Use(middleware.RateLimit(redisClient, cfg.RateLimitMax, cfg.RateLimitWindow))
 
 	// --- 设置路由 ---
 	api := router.Group("/api")
@@ -191,61 +224,64 @@ func NewApp() (*App, error) {
 		authRoutes.POST("/register", authHandler.Register)
 		authRoutes.POST("/login", authHandler.Login)
 	}
-	roomRoutes := api.Group("/rooms").Use(middleware.Auth(cfg.JWTSecret)) // 注入 jwtSecret
+	roomRoutes := api.Group("/rooms").Use(middleware.Auth(cfg.JWTSecret))
 	{
 		roomRoutes.POST("", roomHandler.CreateRoom)
 		roomRoutes.POST("/join", roomHandler.JoinRoom)
 	}
-	wsRoutes := router.Group("/ws").Use(middleware.Auth(cfg.JWTSecret)) // 注入 jwtSecret
+	wsRoutes := router.Group("/ws").Use(middleware.Auth(cfg.JWTSecret))
 	{
 		wsRoutes.GET("/room/:roomId", wsHandler.HandleConnection)
 	}
 	router.GET("/ping", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"message": "pong"}) })
+	log.Info("Router setup complete")
 
+	// 10. 初始化 HTTP Server
+	log.Info("Initializing HTTP server...")
+	httpServer := &http.Server{
+		Addr:    ":" + cfg.ServerPort,
+		Handler: router,
+		// ReadTimeout: 10 * time.Second, // 推荐设置超时
+		// WriteTimeout: 10 * time.Second,
+		// IdleTimeout:  120 * time.Second,
+	}
+	log.Info("HTTP server initialized")
 
-    // 9. 初始化 HTTP Server
-    httpServer := &http.Server{
-        Addr:    ":" + cfg.ServerPort,
-        Handler: router,
-        // 可以设置 ReadTimeout, WriteTimeout 等
-    }
-
-	// 10. 组装 App 对象
+	// 11. 组装 App 对象
+	log.Info("Assembling application...")
 	app := &App{
 		Config:       cfg,
 		Log:          log,
 		DB:           db,
 		RedisClient:  redisClient,
 		AsynqClient:  asynqClient,
-        AsynqServer:  workerServer, // 存储 WorkerServer 实例
+		AsynqServer:  workerServer,
 		Hub:          hubInstance,
 		HttpServer:   httpServer,
+		// actionRepo: actionRepo // 如果 Shutdown 需要，可以存储
 	}
+	log.Info("Application assembled successfully")
 
 	return app, nil
 }
 
 // Start 启动应用的所有后台 Goroutine 和 HTTP 服务器
 func (a *App) Start() {
-	a.Log.Info("Starting application components...")
-	// 启动 Hub
-	go a.Hub.Run() // Hub 现在不接收 repo
+	a.Log.Info("Starting application background routines...")
+	go a.Hub.Run()
 	a.Log.Info("Hub routine started")
 
-	// 启动 Worker Server (需要 actionRepo，但 App 中没有直接存储 repo，可以从参数传入或修改 App 结构)
-    // 我们修改 App 结构来存储 actionRepo
-    // go a.AsynqServer.Start(a.actionRepo) // 假设 actionRepo 已添加到 App
-    // 或者在 NewApp 时就获取 actionRepo 并传递给 NewWorkerServer
-    // 修正：在 NewApp 中已经将 actionRepo 传给 NewWorkerServer 了，这里直接启动
-    go a.AsynqServer.Start() // WorkerServer 的 Start 方法现在不需要参数了
+	go a.AsynqServer.Start() // Start 不再需要参数
 	a.Log.Info("Asynq worker server routine started")
 
 	// 启动 HTTP 服务器
 	go func() {
-		a.Log.Infof("HTTP server starting on %s", a.HttpServer.Addr)
+		a.Log.Infof("HTTP server starting to listen on %s", a.HttpServer.Addr)
 		if err := a.HttpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// 使用 App 的 logger 记录 Fatal 错误
 			a.Log.Fatalf("Failed to start HTTP server: %v", err)
 		}
+		a.Log.Info("HTTP server stopped listening.")
 	}()
 }
 
@@ -253,32 +289,52 @@ func (a *App) Start() {
 func (a *App) Shutdown() {
 	a.Log.Info("Shutting down application...")
 
-	// 关闭 Worker Server
-	a.AsynqServer.Shutdown()
+	// 1. 停止 Hub 的订阅
+	// Hub 的 Run 方法会在其 channel 关闭时退出，我们还需要停止订阅
+	if a.Hub != nil { // 检查 Hub 是否已初始化
+		a.Hub.StopAllSubscriptions() // 调用停止订阅方法
+	}
 
-	// 关闭 HTTP 服务器
+	// 2. 优雅关闭 Worker Server
+	if a.AsynqServer != nil { // 检查 Worker 是否已初始化
+		a.AsynqServer.Shutdown()
+	}
+
+	// 3. 优雅关闭 HTTP 服务器
 	a.Log.Info("Shutting down HTTP server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // 增加超时时间
 	defer cancel()
 	if err := a.HttpServer.Shutdown(ctx); err != nil {
 		a.Log.Errorf("Error shutting down HTTP server: %v", err)
+	} else {
+		a.Log.Info("HTTP server shut down gracefully.")
 	}
 
-	// 关闭 Asynq Client
-	if err := a.AsynqClient.Close(); err != nil {
-		a.Log.Errorf("Error closing Asynq client: %v", err)
+	// 4. 关闭 Asynq Client
+	if a.AsynqClient != nil { // 检查 Asynq Client 是否已初始化
+		if err := a.AsynqClient.Close(); err != nil {
+			a.Log.Errorf("Error closing Asynq client: %v", err)
+		} else {
+			a.Log.Info("Asynq client closed.")
+		}
 	}
 
-	// 关闭 Redis 连接
-	if err := a.RedisClient.Close(); err != nil {
-		a.Log.Errorf("Error closing Redis connection: %v", err)
+	// 5. 关闭 Redis 连接
+	if a.RedisClient != nil { // 检查 Redis Client 是否已初始化
+		if err := a.RedisClient.Close(); err != nil {
+			a.Log.Errorf("Error closing Redis connection: %v", err)
+		} else {
+			a.Log.Info("Redis connection closed.")
+		}
 	}
 
-	// 关闭数据库连接 (GORM V2 通常不需要)
+	// 6. 关闭数据库连接 (GORM V2 通常不需要显式关闭连接池)
 	// sqlDB, err := a.DB.DB()
-	// if err == nil {
+	// if err == nil && sqlDB != nil {
 	//     if err := sqlDB.Close(); err != nil {
 	//         a.Log.Errorf("Error closing database connection: %v", err)
+	//     } else {
+	//         a.Log.Info("Database connection closed.")
 	//     }
 	// }
 
@@ -298,20 +354,27 @@ func LoggerMiddleware(log *logrus.Logger) gin.HandlerFunc {
 		if c.Request.URL.RawQuery != "" {
 			path = path + "?" + c.Request.URL.RawQuery
 		}
-        errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String() // 获取 Gin 错误
+		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
 
 		entry := log.WithFields(logrus.Fields{
-			"statusCode": statusCode,
-			"latency":    latency,
-			"clientIP":   clientIP,
-			"method":     method,
-			"path":       path,
+			"status_code": statusCode, // 更标准的字段名
+			"latency_ms":  latency.Milliseconds(), // 记录毫秒数
+			"client_ip":   clientIP,
+			"method":      method,
+			"path":        path,
 		})
 
-        if errorMessage != "" {
-             entry.Error(errorMessage)
-        } else {
-		    entry.Info("Handled request")
-        }
+		if errorMessage != "" {
+			entry.Error(errorMessage)
+		} else {
+			// 区分状态码记录日志级别
+			if statusCode >= 500 {
+				entry.Error("Server error")
+			} else if statusCode >= 400 {
+				entry.Warn("Client error")
+			} else {
+				entry.Info("Request handled")
+			}
+		}
 	}
 }

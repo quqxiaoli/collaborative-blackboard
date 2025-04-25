@@ -3,14 +3,18 @@ package hub
 import (
 	"context"
 	"encoding/json" // 用于序列化快照和 Action 消息
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	// 导入正确的路径
-	//"collaborative-blackboard/internal/domain" // 需要 domain.Snapshot 等
+	// 需要 domain.Snapshot 等
+	"collaborative-blackboard/internal/domain"
 	"collaborative-blackboard/internal/service"
-	//"collaborative-blackboard/internal/repository"
 	"collaborative-blackboard/internal/tasks" // 导入任务定义包
+
 	// 导入 Asynq Client 和 Task 相关
 	"github.com/hibiken/asynq"
 	//"github.com/gorilla/websocket" // 需要导入以在 client.go 中使用（虽然这里没直接用）
@@ -34,11 +38,11 @@ const (
 
 // HubMessage 定义了在 Hub 内部通道传递的消息类型
 type HubMessage struct {
-	Type     string      // "register", "unregister", "action"
-	RoomID   uint        // 房间 ID
-	UserID   uint        // 来源用户 ID (用于 Action 和识别 Client)
-	Client   *Client     // 仅用于 register/unregister (和 action 关联的 client)
-	RawData  []byte      // 仅用于 action (原始 WebSocket 消息)
+	Type    string  // "register", "unregister", "action"
+	RoomID  uint    // 房间 ID
+	UserID  uint    // 来源用户 ID (用于 Action 和识别 Client)
+	Client  *Client // 仅用于 register/unregister (和 action 关联的 client)
+	RawData []byte  // 仅用于 action (原始 WebSocket 消息)
 	// Context context.Context // 如果 Service 调用需要特定的 Context
 }
 
@@ -57,12 +61,19 @@ type Hub struct {
 	roomsMu sync.RWMutex
 
 	// 注入的 Service，用于处理业务逻辑
-	collabService *service.CollaborationService
+	collabService   *service.CollaborationService
 	snapshotService *service.SnapshotService
+
+	// 新增: Redis 依赖和订阅管理
+	redisClient *redis.Client             // Redis 客户端实例
+	keyPrefix   string                    // Redis key 前缀
+	// 用于管理每个房间订阅 Goroutine 的 context cancel func
+	roomSubscriptions map[uint]context.CancelFunc
+	subMu             sync.Mutex          // 保护 roomSubscriptions map 的访问
 }
 
 // NewHub 创建并返回一个新的 Hub 实例
-func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client) *Hub {
+func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client,redisClient *redis.Client,keyPrefix string) *Hub {
 	// 启动时检查依赖注入是否有效
 	if collabService == nil {
 		panic("CollaborationService cannot be nil for Hub")
@@ -70,14 +81,23 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 	if snapshotService == nil {
 		panic("SnapshotService cannot be nil for Hub")
 	}
-	if asynqClient == nil { panic("Asynq Client cannot be nil for Hub") } // 检查依赖
+	if asynqClient == nil {
+		panic("Asynq Client cannot be nil for Hub")
+	} 
+	if redisClient == nil { 
+		panic("Redis client cannot be nil for Hub") 
+	} // 检查依赖
+	if keyPrefix == "" { keyPrefix = "bb:" } // 设置默认前缀
 	return &Hub{
 		// 创建带缓冲区的通道，大小可根据预期负载调整
-		messageChan:   make(chan HubMessage, 512),
+		messageChan:     make(chan HubMessage, 512),
 		asynqClient:     asynqClient, // 存储注入的 client
-		rooms:         make(map[uint]map[*Client]bool),
-		collabService: collabService,
+		rooms:           make(map[uint]map[*Client]bool),
+		collabService:   collabService,
 		snapshotService: snapshotService,
+		redisClient:       redisClient, // 存储依赖
+		keyPrefix:         keyPrefix,   // 存储依赖
+		roomSubscriptions: make(map[uint]context.CancelFunc), // 初始化 map
 	}
 }
 
@@ -112,8 +132,6 @@ func (h *Hub) Run() {
 	// h.asynqClient.Close()
 }
 
-
-
 // registerClient 处理客户端注册逻辑
 func (h *Hub) registerClient(client *Client) {
 	// 防御性编程：检查 client 是否为 nil
@@ -130,18 +148,26 @@ func (h *Hub) registerClient(client *Client) {
 	})
 
 	h.roomsMu.Lock()
-	// 检查房间是否存在，不存在则创建
-	if _, ok := h.rooms[roomID]; !ok {
+	roomClients, roomExists := h.rooms[roomID]
+	if !roomExists {
 		h.rooms[roomID] = make(map[*Client]bool)
+		roomClients = h.rooms[roomID]
 		logCtx.Info("Client list created for new room")
 	}
-	// 将客户端添加到房间
-	h.rooms[roomID][client] = true
-	h.roomsMu.Unlock() // 操作完成后立即解锁
+	roomClients[client] = true
+	// 检查是否是这个房间的第一个客户端
+	isFirstClientInRoom := len(roomClients) == 1
+	h.roomsMu.Unlock() // 尽快释放锁
 	logCtx.Info("Client registered to Hub")
 
-	// 异步获取并发送初始快照给新客户端
-	go h.sendInitialSnapshot(client)
+	// --- 如果是这个房间的第一个客户端，启动订阅 ---
+	if isFirstClientInRoom {
+		logCtx.Info("First client in room, starting Redis subscription...")
+		h.startRoomSubscription(roomID) // 调用启动订阅的方法
+	}
+	// --- 订阅逻辑结束 ---
+
+	go h.sendInitialSnapshot(client) // 发送快照不变
 }
 
 // unregisterClient 处理客户端注销逻辑
@@ -157,46 +183,42 @@ func (h *Hub) unregisterClient(client *Client) {
 		"user_id": userID,
 		"action":  "unregisterClient",
 	})
+	shouldStopSubscription := false // 标记是否需要停止订阅
 
 	h.roomsMu.Lock()
-	// 检查房间和客户端是否存在
 	if roomClients, roomExists := h.rooms[roomID]; roomExists {
 		if _, clientExists := roomClients[client]; clientExists {
-			// 从房间中删除客户端
 			delete(roomClients, client)
 			logCtx.Debug("Client removed from room map")
-
-			// 关闭此客户端的 send 通道，这将导致其 WritePump 退出
-			// 需要检查通道是否已关闭，防止重复关闭 panic
 			select {
-			case <-client.send:
-				// 通道已关闭或有残留数据（理论上不应有残留）
-				logCtx.Warn("Client send channel already closed or has data during unregister")
-			default:
-				// 通道未关闭，安全地关闭它
-				close(client.send)
-				logCtx.Info("Client send channel closed")
+			case <-client.send: // 检查是否已关闭
+			default: close(client.send); logCtx.Info("Client send channel closed")
 			}
 
-			// 如果房间变空，则从 Hub 中删除该房间记录
+			// 检查房间是否变空
 			if len(roomClients) == 0 {
-				delete(h.rooms, roomID)
+				delete(h.rooms, roomID) // 从 Hub 中移除房间
 				logCtx.Info("Room empty, removed from Hub")
-				// TODO: 在这里或专门的清理任务中触发房间相关资源的清理 (如 Redis keys)
+				shouldStopSubscription = true // 标记需要停止此房间的订阅
 			}
-		} else {
-			logCtx.Warn("Client not found in room during unregister")
-		}
-	} else {
-		logCtx.Warn("Room not found during client unregister")
-	}
-	h.roomsMu.Unlock()
+		} else { logCtx.Warn("Client not found in room during unregister") }
+	} else { logCtx.Warn("Room not found during client unregister") }
+	h.roomsMu.Unlock() // 尽快释放锁
 	logCtx.Info("Client unregistered from Hub")
+
+	// --- 如果房间空了，停止该房间的订阅 ---
+	if shouldStopSubscription {
+		logCtx.Info("Room is now empty, stopping Redis subscription...")
+		h.stopRoomSubscription(roomID) // 调用停止订阅的方法
+	}
+	// --- 订阅逻辑结束 ---
 }
 
 // sendInitialSnapshot 异步获取并发送快照给新连接的客户端
 func (h *Hub) sendInitialSnapshot(client *Client) {
-	if client == nil { return }
+	if client == nil {
+		return
+	}
 	logCtx := logrus.WithFields(logrus.Fields{
 		"room_id":   client.RoomID(),
 		"user_id":   client.UserID(),
@@ -224,7 +246,7 @@ func (h *Hub) sendInitialSnapshot(client *Client) {
 	snapshotMsg := map[string]interface{}{
 		"type":    "snapshot",
 		"version": snapshot.Version, // 使用从 Service 获取的快照版本
-		"state":   boardState,     // 使用从 Service 获取的 BoardState
+		"state":   boardState,       // 使用从 Service 获取的 BoardState
 	}
 	stateBytes, err := json.Marshal(snapshotMsg)
 	if err != nil {
@@ -265,18 +287,11 @@ func (h *Hub) handleClientAction(msg HubMessage) {
 		return
 	}
 
-	// 如果 Service 处理成功并且需要广播 (Action 不是 noop)
+	// Service 已经通过 stateRepo.PublishAction 发布了消息
+	// Hub 不再需要调用 broadcast 方法来广播 Action
 	if shouldBroadcast && processedAction != nil {
-		logCtx.WithField("action_version", processedAction.Version).Info("Action processed, broadcasting...")
-		// 序列化处理后的 Action 用于广播
-		broadcastMsgBytes, err := json.Marshal(processedAction)
-		if err != nil {
-			logCtx.WithError(err).Error("Failed to marshal processed action for broadcast")
-			return
-		}
+		logCtx.WithField("action_version", processedAction.Version).Info("Action processed by service and published via repository, queuing persistence task...")
 
-		// 调用广播方法，排除发送者 (msg.Client)
-		h.broadcast(msg.RoomID, broadcastMsgBytes, msg.Client)
 
 		// --- 修改：使用 Asynq 将持久化任务入队 ---
 		// 1. 创建任务 Payload
@@ -306,48 +321,138 @@ func (h *Hub) handleClientAction(msg HubMessage) {
 	}
 }
 
+// --- 新增: Pub/Sub 订阅相关方法 ---
 
-// broadcast 将消息发送给指定房间的所有客户端，排除发送者
-func (h *Hub) broadcast(roomID uint, message []byte, sender *Client) {
-	h.roomsMu.RLock()
-	roomClients, ok := h.rooms[roomID]
-	// 创建一个接收者列表的副本，以避免长时间持有锁
-	clientsToSend := make([]*Client, 0, len(roomClients))
-	if ok {
-		for client := range roomClients {
-			// 排除发送者
-			if client != sender {
-				clientsToSend = append(clientsToSend, client)
-			}
-		}
-	}
-	h.roomsMu.RUnlock() // 尽快释放读锁
+// startRoomSubscription 启动指定房间的 Redis Pub/Sub 订阅 Goroutine
+func (h *Hub) startRoomSubscription(roomID uint) {
+	h.subMu.Lock() // 保护对 roomSubscriptions 的访问
+	defer h.subMu.Unlock()
 
-	// 如果没有接收者，则直接返回
-	if !ok || len(clientsToSend) == 0 {
+	if _, exists := h.roomSubscriptions[roomID]; exists {
+		logrus.Warnf("Hub: Subscription for room %d already exists", roomID)
 		return
 	}
 
-	logCtx := logrus.WithFields(logrus.Fields{
-		"room_id":         roomID,
-		"message_size":    len(message),
-		"recipient_count": len(clientsToSend),
-	})
-	if sender != nil {
-		logCtx = logCtx.WithField("sender_user_id", sender.UserID())
-	}
-	logCtx.Debug("Broadcasting message to clients")
+	ctx, cancel := context.WithCancel(context.Background())
+	h.roomSubscriptions[roomID] = cancel // 存储 cancel 函数
 
-	// 遍历副本列表进行发送
-	for _, client := range clientsToSend {
-		// 使用非阻塞发送，避免单个慢客户端阻塞广播
+	logCtx := logrus.WithFields(logrus.Fields{"room_id": roomID, "component": "subscriber"})
+	logCtx.Info("Starting Redis subscription loop...")
+
+	go h.roomSubscribeLoop(ctx, roomID, logCtx)
+}
+
+// stopRoomSubscription 停止指定房间的 Redis Pub/Sub 订阅 Goroutine
+func (h *Hub) stopRoomSubscription(roomID uint) {
+	h.subMu.Lock()
+	defer h.subMu.Unlock()
+
+	logCtx := logrus.WithFields(logrus.Fields{"room_id": roomID, "component": "subscriber"})
+
+	if cancel, exists := h.roomSubscriptions[roomID]; exists {
+		logCtx.Info("Stopping Redis subscription loop...")
+		cancel() // 调用 cancel 函数通知 Goroutine 退出
+		delete(h.roomSubscriptions, roomID)
+		logCtx.Info("Subscription cancelled and removed.")
+	} else {
+		logCtx.Warnf("Attempted to stop subscription for room %d, but no active subscription found.", roomID)
+	}
+}
+
+// stopAllSubscriptions 在 Hub 关闭时停止所有房间的订阅
+func (h *Hub) StopAllSubscriptions() {
+    h.subMu.Lock()
+    defer h.subMu.Unlock()
+    logrus.Info("Hub shutting down, stopping all room subscriptions...")
+    count := 0
+    for roomID, cancel := range h.roomSubscriptions {
+        cancel() // 通知 Goroutine 退出
+        delete(h.roomSubscriptions, roomID)
+        count++
+    }
+    logrus.Infof("Stopped %d room subscriptions.", count)
+}
+
+
+// roomSubscribeLoop 是每个房间订阅 Goroutine 的主循环体
+func (h *Hub) roomSubscribeLoop(ctx context.Context, roomID uint, logCtx *logrus.Entry) {
+	// 构造频道名称
+	channel := fmt.Sprintf("%sroom:%d:pubsub", h.keyPrefix, roomID)
+	// 使用 Hub 持有的 Redis Client 订阅频道
+	pubsub := h.redisClient.Subscribe(ctx, channel)
+
+	// 检查订阅是否成功或被取消
+	_, err := pubsub.Receive(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, redis.ErrClosed) { // 忽略 context canceled 和 redis closed 错误
+			logCtx.WithError(err).Errorf("Failed to subscribe to Redis channel %s", channel)
+		} else {
+			logCtx.Info("Subscription cancelled or Redis closed before confirmation.")
+		}
+		// 确保从 Hub 的 map 中移除 (即使 stop 被调用，也做一次检查)
+        h.subMu.Lock()
+        delete(h.roomSubscriptions, roomID)
+        h.subMu.Unlock()
+        _ = pubsub.Close()
+		return
+	}
+	logCtx.Infof("Successfully subscribed to Redis channel %s", channel)
+	msgChan := pubsub.Channel() // 获取消息通道
+
+	// 在 Goroutine 退出时确保取消订阅和关闭
+	defer func() {
+		// 使用后台 context 取消订阅，因为原始 ctx 可能已关闭
+		bgCtx := context.Background()
+		if err := pubsub.Unsubscribe(bgCtx, channel); err != nil {
+			logCtx.WithError(err).Warnf("Error unsubscribing from channel %s on exit", channel)
+		}
+		if err := pubsub.Close(); err != nil {
+			logCtx.WithError(err).Warn("Error closing pubsub connection on exit")
+		}
+        // 确保从 Hub map 中移除
+        h.subMu.Lock()
+        delete(h.roomSubscriptions, roomID)
+        h.subMu.Unlock()
+		logCtx.Info("Subscription loop stopped.")
+	}()
+
+	for {
 		select {
-		case client.send <- message:
-			// 消息成功放入该客户端的发送队列
-		default:
-			// 如果客户端的发送通道已满，记录警告。
-			// 让该客户端的 WritePump 或清理任务负责处理后续问题（如断开连接）。
-			logCtx.WithField("receiver_user_id", client.UserID()).Warn("Client send channel full during broadcast, skipping this client")
+		case <-ctx.Done(): // 监听 Hub 主动停止信号
+			logCtx.Info("Context cancelled, exiting subscription loop.")
+			return // 退出
+
+		case msg, ok := <-msgChan: // 从 Redis 接收消息
+			if !ok {
+				logCtx.Warn("Redis Pub/Sub channel closed unexpectedly.")
+				return // 退出
+			}
+
+			logCtx.Debugf("Received message from Redis (size: %d)", len(msg.Payload))
+
+			// 解析 Action 以获取 UserID
+			var receivedAction domain.Action
+			if err := json.Unmarshal([]byte(msg.Payload), &receivedAction); err != nil {
+				logCtx.WithError(err).Warn("Failed to unmarshal action from Pub/Sub")
+				continue // 忽略错误消息
+			}
+
+			// 将消息广播给房间内所有客户端 (排除发送者)
+			// 使用读锁安全访问 rooms map
+			h.roomsMu.RLock()
+			if roomClients, exists := h.rooms[roomID]; exists {
+				for client := range roomClients {
+					// **排除原始发送者**
+					if client.UserID() != receivedAction.UserID {
+						select {
+						case client.send <- []byte(msg.Payload): // 发送原始 JSON
+						default:
+							logCtx.WithField("receiver_user_id", client.UserID()).Warn("Client send channel full when forwarding Pub/Sub message")
+						}
+					}
+				}
+			}
+			h.roomsMu.RUnlock() // 释放读锁
 		}
 	}
 }
@@ -372,7 +477,6 @@ func (h *Hub) QueueMessage(msg HubMessage) bool {
 	}
 }
 
-
 // *** 添加 MessageChan 方法 ***
 // MessageChan 返回一个只写的 channel，用于外部向 Hub 发送消息。
 // 这种方式比直接暴露 messageChan 更好，但仍然允许外部阻塞 Hub（如果队列满）。
@@ -381,7 +485,7 @@ func (h *Hub) QueueMessage(msg HubMessage) bool {
 // 考虑到我们之前在 Handler 中使用了 select default，QueueMessage 可能是更一致的选择。
 // 我们暂时添加它以解决编译错误，但可以考虑是否真的需要它。
 func (h *Hub) MessageChan() chan<- HubMessage {
-    return h.messageChan
+	return h.messageChan
 }
 
 // --- 不再包含 Client, NewClient, readPump, writePump ---

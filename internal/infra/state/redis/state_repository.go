@@ -40,7 +40,6 @@ func NewRedisStateRepository(client *redis.Client, keyPrefix string) *RedisState
 }
 
 // --- Key Generation Helpers ---
-
 func (r *RedisStateRepository) roomStateKey(roomID uint) string {
 	return fmt.Sprintf("%sroom:%d:state", r.keyPrefix, roomID)
 }
