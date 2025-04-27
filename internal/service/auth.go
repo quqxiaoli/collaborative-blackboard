@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	// 使用正确的模块路径
@@ -70,14 +69,11 @@ func (s *AuthService) Register(ctx context.Context, username, password, email st
 	// 4. 保存用户 (调用 Repository 接口)
 	err = s.userRepo.Save(ctx, user)
 	if err != nil {
-		// 优先检查是否是仓库层返回的特定错误
-		if errors.Is(err, repository.ErrDuplicateEntry) {
-			logCtx.WithError(err).Warn("Registration failed: Username or email already exists (repo error)")
-			return nil, ErrRegistrationFailed // 返回业务错误
-		} else if isDuplicateEntryErrorString(err) { // 临时的字符串检查作为后备
-			logCtx.WithError(err).Warn("Registration failed: Username or email already exists (string check)")
-			return nil, ErrRegistrationFailed
-		}
+		// --- 只检查来自 Repository 的特定错误 ---
+        if errors.Is(err, repository.ErrDuplicateEntry) {
+            logCtx.WithError(err).Warn("Registration failed: Username or email already exists (repo error)")
+            return nil, ErrRegistrationFailed // 返回业务错误
+        }
 		// 其他数据库错误
 		logCtx.WithError(err).Error("Database error during user creation")
 		return nil, ErrInternalServer
@@ -158,16 +154,4 @@ func (s *AuthService) generateJWT(userID uint) (string, error) {
 		return "", fmt.Errorf("failed to sign token: %w", err)
 	}
 	return tokenString, nil
-}
-
-// isDuplicateEntryErrorString (临时的字符串检查)
-// TODO: 当 GormUserRepository 返回 repository.ErrDuplicateEntry 后移除此函数
-func isDuplicateEntryErrorString(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") ||
-		strings.Contains(msg, "Duplicate entry") ||
-		strings.Contains(msg, "duplicate key value violates unique constraint")
 }

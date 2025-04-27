@@ -54,15 +54,11 @@ func (s *RoomService) CreateRoom(ctx context.Context, creatorID uint) (*domain.R
 	// 3. 保存房间 (调用 Repository 接口)
 	err = s.roomRepo.Save(ctx, room)
 	if err != nil {
-		// 依赖 Repository 返回明确的错误类型
-		if errors.Is(err, repository.ErrDuplicateEntry) {
-			logCtx.WithError(err).Error("Failed to save new room due to duplicate entry (invite code conflict?)")
-			// 理论上不应发生，返回内部错误
-			return nil, ErrInternalServer
-		} else if isDuplicateEntryErrorString(err) { // 临时后备检查
-			logCtx.WithError(err).Error("Failed to save new room due to duplicate entry (invite code conflict?)")
-			return nil, ErrInternalServer
-		}
+		// --- 只检查来自 Repository 的特定错误 ---
+        if errors.Is(err, repository.ErrDuplicateEntry) {
+            logCtx.WithError(err).Error("Failed to save new room due to duplicate entry (invite code conflict?)")
+            return nil, ErrInternalServer // 理论上不应发生，视为内部错误
+        }
 		// 其他数据库错误
 		logCtx.WithError(err).Error("Failed to save new room to database")
 		return nil, ErrInternalServer
@@ -166,5 +162,4 @@ func (s *RoomService) generateUniqueInviteCode(ctx context.Context) (string, err
 	return "", fmt.Errorf("failed to generate a unique invite code after %d attempts", maxAttempts)
 }
 
-// isDuplicateEntryErrorString (如果需要，从 auth.go 复制或移到共享位置)
 // func isDuplicateEntryErrorString(err error) bool { ... }
