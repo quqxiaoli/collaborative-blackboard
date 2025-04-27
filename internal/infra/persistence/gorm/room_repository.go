@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
 	//"strings" // 用于 isDuplicateEntryError
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 
 	// 使用正确的 Domain 模型路径 (internal/domain) 和 Repository 接口路径
@@ -57,14 +59,15 @@ func (r *GormRoomRepository) Save(ctx context.Context, roomData *domain.Room) er
 	result := r.db.WithContext(ctx).Save(roomData)
 	err := result.Error
 	if err != nil {
-		// 检查 invite_code 唯一约束错误
-		// TODO: 替换为更健壮的唯一约束错误检查
-		if isDuplicateEntryError(err) { // 使用与 user_repository 相同的辅助函数
-			return repository.ErrDuplicateEntry
-		}
-		return fmt.Errorf("gorm: save room (id: %d, invite_code: %s): %w", roomData.ID, roomData.InviteCode, err)
-	}
-	return nil
+        // --- 健壮的唯一约束检查 (以 MySQL 为例) ---
+        var mysqlErr *mysql.MySQLError
+        if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+            return repository.ErrDuplicateEntry // 映射为定义的仓库错误
+        }
+        // --- 检查结束 ---
+        return fmt.Errorf("gorm: save room (id: %d, invite_code: %s): %w", roomData.ID, roomData.InviteCode, err)
+    }
+    return nil
 }
 
 // FindAllActive 实现根据 ID 列表批量获取房间信息
@@ -94,6 +97,3 @@ func (r *GormRoomRepository) IsInviteCodeExists(ctx context.Context, code string
 	// 如果 count > 0，则表示存在
 	return count > 0, nil
 }
-
-// isDuplicateEntryError (如果 user_repository.go 中未定义，则在此定义或移至共享位置)
-// func isDuplicateEntryError(err error) bool { ... } // 同上

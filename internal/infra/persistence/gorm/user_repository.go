@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings" // 用于检查错误字符串 (临时方案)
 
+	//"strings" // 用于检查错误字符串 (临时方案)
+
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	// "gorm.io/gorm/clause" // Save 方法暂时不需要这个
 
@@ -71,33 +73,16 @@ func (r *GormUserRepository) Save(ctx context.Context, user *domain.User) error 
 	err := result.Error
 
 	if err != nil {
-		// 尝试检查是否是唯一约束错误
-		// TODO: 替换为更健壮的唯一约束错误检查方式
-		if isDuplicateEntryError(err) {
-			return repository.ErrDuplicateEntry // 映射为定义的仓库错误
-		}
-		// 返回包装后的其他错误
-		return fmt.Errorf("gorm: save user (id: %d, username: %s): %w", user.ID, user.Username, err)
-	}
+        // --- 健壮的唯一约束检查 ---
+        var mysqlErr *mysql.MySQLError
+        if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 { // 1062 是 MySQL 的 Duplicate entry 错误号
+            return repository.ErrDuplicateEntry // 返回定义的仓库错误
+        }
+        // --- 检查结束 ---
 
-	// 可选：检查是否有行受到影响
-	// if result.RowsAffected == 0 && user.ID != 0 {
-	//     // 如果是更新操作但没有行受影响，可能表示记录不存在？
-	//     // 但 Save 通常不用于这种情况，Find + Update 更合适
-	// }
-
-	return nil
+        // 其他数据库错误
+        return fmt.Errorf("gorm: save user (id: %d, username: %s): %w", user.ID, user.Username, err)
+    }
+    return nil
 }
 
-// isDuplicateEntryError 是一个临时的辅助函数，用于检查常见的唯一约束错误字符串。
-// 强烈建议替换为特定数据库驱动的错误检查。
-func isDuplicateEntryError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	// 常见的错误信息片段
-	return strings.Contains(msg, "UNIQUE constraint failed") || // SQLite
-		strings.Contains(msg, "Duplicate entry") || // MySQL
-		strings.Contains(msg, "duplicate key value violates unique constraint") // PostgreSQL
-}
