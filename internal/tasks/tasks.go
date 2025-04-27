@@ -8,8 +8,7 @@ import (
 // 定义任务类型常量
 const (
 	TypeActionPersistence = "action:persist" // Action 持久化任务类型
-	// 可以定义其他任务类型，例如:
-	// TypeSnapshotGeneration = "snapshot:generate"
+	 TypeSnapshotGeneration = "snapshot:generate"
 	// TypeClientCleanup      = "client:cleanup"
 )
 
@@ -35,4 +34,10 @@ func NewActionPersistenceTask(action domain.Action) ([]byte, error) {
 	// 注意：Asynq 的 NewTask 现在推荐直接传递 []byte payload
 	// task := asynq.NewTask(TypeActionPersistence, payloadBytes)
 	return payloadBytes, nil // 返回序列化后的 payload
+}
+
+const TypeSnapshotPeriodicCheck = "snapshot:periodic_check"
+
+func NewSnapshotPeriodicCheckTask() ([]byte, error) {
+	return []byte(""), nil // Payload 可以是空字符串或 nil
 }

@@ -27,6 +27,7 @@ import (
 	//"collaborative-blackboard/internal/repository" 
 	"collaborative-blackboard/internal/service"
 	"collaborative-blackboard/internal/worker"
+	"collaborative-blackboard/internal/tasks"
 )
 
 // Config 结构体用于存储从环境变量或文件加载的配置
@@ -105,6 +106,7 @@ type App struct {
 	AsynqServer  *worker.WorkerServer
 	Hub          *hub.Hub
 	HttpServer   *http.Server
+	redisClientOpt asynq.RedisClientOpt
 	// 可以存储其他组件以便 Shutdown 时访问，或者仅在 NewApp 中使用
 	// actionRepo   repository.ActionRepository
 }
@@ -188,7 +190,7 @@ func NewApp() (*App, error) {
 
 	// 8. 初始化 Worker Server
 	log.Info("Initializing worker server...")
-	workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, log)
+	workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, hubInstance, snapshotService, log)
 	log.Info("Worker server initialized")
 
 	// 9. 初始化 Gin Engine 和路由
@@ -274,6 +276,8 @@ func (a *App) Start() {
 	go a.AsynqServer.Start() // Start 不再需要参数
 	a.Log.Info("Asynq worker server routine started")
 
+	a.registerPeriodicTasks()
+
 	// 启动 HTTP 服务器
 	go func() {
 		a.Log.Infof("HTTP server starting to listen on %s", a.HttpServer.Addr)
@@ -283,6 +287,45 @@ func (a *App) Start() {
 		}
 		a.Log.Info("HTTP server stopped listening.")
 	}()
+}
+
+
+func (a *App) registerPeriodicTasks() {
+    scheduler := asynq.NewScheduler(a.redisClientOpt, &asynq.SchedulerOpts{
+        // Location: time.UTC, // 可以设置时区
+    })
+
+    // 创建周期性快照检查任务
+    taskPayload, err := tasks.NewSnapshotPeriodicCheckTask()
+    if err != nil {
+        a.Log.Errorf("Failed to create snapshot periodic check task payload: %v", err)
+        return // 或者 panic?
+    }
+    task := asynq.NewTask(tasks.TypeSnapshotPeriodicCheck, taskPayload)
+
+    schedule := "@every 5m"
+    // --- 使用 _ 忽略 entryID，或者在日志中使用它 ---
+    entryID, err := scheduler.Register(schedule, task, asynq.Queue("default")) // <--- 使用 _ 或者 entryID
+    if err != nil {
+        a.Log.Errorf("Could not register periodic snapshot check task: %v", err)
+    } else {
+        // --- 在日志中使用 entryID ---
+        a.Log.Infof("Periodic snapshot check task registered with schedule '%s' (EntryID: %s)", schedule, entryID)
+    }
+
+    // 启动 Scheduler (需要在一个 goroutine 中运行)
+    go func() {
+        a.Log.Info("Asynq scheduler starting...")
+        if err := scheduler.Run(); err != nil {
+            // 通常 scheduler.Run() 在正常关闭时也会返回错误
+             if !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, asynq.ErrServerClosed){ // 检查是否是关闭错误
+                 a.Log.Errorf("Asynq scheduler Run() failed: %v", err)
+             } else {
+                 a.Log.Info("Asynq scheduler stopped.")
+             }
+        }
+    }()
+    // 注意：优雅关闭时可能也需要停止 scheduler
 }
 
 // Shutdown 优雅地关闭应用

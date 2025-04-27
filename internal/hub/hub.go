@@ -592,6 +592,20 @@ func (h *Hub) QueueMessage(msg HubMessage) bool {
 	}
 }
 
+// --- 新增: 获取活跃房间 ID 的方法 ---
+// GetActiveRoomIDs 返回当前 Hub 中有客户端连接的所有房间 ID 列表。
+// 这个方法是并发安全的。
+func (h *Hub) GetActiveRoomIDs() []uint {
+	h.roomsMu.RLock() // 加读锁
+	defer h.roomsMu.RUnlock() // 保证锁释放
+
+	ids := make([]uint, 0, len(h.rooms)) // 预分配容量
+	for id := range h.rooms {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // *** 添加 MessageChan 方法 ***
 // MessageChan 返回一个只写的 channel，用于外部向 Hub 发送消息。
 // 这种方式比直接暴露 messageChan 更好，但仍然允许外部阻塞 Hub（如果队列满）。

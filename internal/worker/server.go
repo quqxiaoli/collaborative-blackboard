@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http" // 需要导入 http 以检查 ErrServerClosed
+	//"sync"
+	//"time"
 
 	"github.com/hibiken/asynq"
 	"github.com/sirupsen/logrus"
@@ -11,6 +13,8 @@ import (
 	// 导入内部包
 	"collaborative-blackboard/internal/repository"
 	"collaborative-blackboard/internal/tasks"
+	"collaborative-blackboard/internal/hub"      
+	"collaborative-blackboard/internal/service"  
 )
 
 // WorkerServer 封装了 Asynq Worker Server 的启动和关闭逻辑
@@ -18,10 +22,12 @@ type WorkerServer struct {
 	server *asynq.Server
 	log    *logrus.Entry
 	actionRepo repository.ActionRepository // 将 actionRepo 存储在结构体中
+	hub             *hub.Hub             // <--- 新增 Hub 依赖
+	snapshotService *service.SnapshotService // <--- 新增 SnapshotService 依赖
 }
 
 // NewWorkerServer 创建一个新的 WorkerServer 实例
-func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.ActionRepository, logger *logrus.Logger) *WorkerServer {
+func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.ActionRepository, hub *hub.Hub,snapshotService *service.SnapshotService,logger *logrus.Logger,) *WorkerServer {
 	logEntry := logger.WithField("component", "worker_server")
 
 	server := asynq.NewServer(
@@ -54,10 +60,15 @@ func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.Action
 		},
 	)
 
+	if hub == nil { panic("Hub cannot be nil for WorkerServer") }
+    if snapshotService == nil { panic("SnapshotService cannot be nil for WorkerServer") }
+
 	return &WorkerServer{
 		server: server,
 		log:    logEntry,
 		actionRepo: actionRepo, // 存储 actionRepo
+		hub:             hub,             
+		snapshotService: snapshotService, 
 	}
 }
 
@@ -69,6 +80,10 @@ func (ws *WorkerServer) Start() {
 	// 注册任务处理器
 	actionPersistenceHandler := NewActionPersistenceHandler(ws.actionRepo)
 	mux.HandleFunc(tasks.TypeActionPersistence, actionPersistenceHandler.ProcessTask)
+
+	snapshotCheckHandler := NewSnapshotCheckHandler(ws.hub, ws.snapshotService) // 注入依赖
+	mux.HandleFunc(tasks.TypeSnapshotPeriodicCheck, snapshotCheckHandler.ProcessTask)
+	// --- 注册结束 ---
 
 	// TODO: 注册其他任务处理器
 

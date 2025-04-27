@@ -19,6 +19,7 @@ require (
 	github.com/redis/go-redis/v9 v9.7.0 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
+	github.com/stretchr/objx v0.5.2 // indirect
 	golang.org/x/time v0.8.0 // indirect
 )
 

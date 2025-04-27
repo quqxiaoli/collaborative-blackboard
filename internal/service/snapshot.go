@@ -62,36 +62,35 @@ func (s *SnapshotService) GetSnapshotForClient(ctx context.Context, roomID uint)
 	} else if errors.Is(err, repository.ErrNotFound) {
 		logCtx.Info("Snapshot cache miss")
 	} else {
-        // err == nil && cachedSnapshot == nil (理论上 Redis 不会这样返回)
-        logCtx.Info("Snapshot cache miss (nil snapshot without error)")
-    }
-
+		// err == nil && cachedSnapshot == nil (理论上 Redis 不会这样返回)
+		logCtx.Info("Snapshot cache miss (nil snapshot without error)")
+	}
 
 	// 2. 缓存未命中或解析失败，尝试从数据库获取最新快照
 	dbSnapshot, err := s.snapshotRepo.GetLatestSnapshot(ctx, roomID)
 	if err != nil {
 		// 检查是否是未找到错误
-		if errors.Is(err, repository.ErrSnapshotNotFound) || errors.Is(err, repository.ErrNotFound){ // 检查特定或通用错误
+		if errors.Is(err, repository.ErrSnapshotNotFound) || errors.Is(err, repository.ErrNotFound) { // 检查特定或通用错误
 			logCtx.Info("No snapshot found in database, returning empty state")
 			// 没有快照，返回空状态和版本 0
 			emptySnapshot := &domain.Snapshot{
-				RoomID: roomID,
+				RoomID:  roomID,
 				Version: 0,
-                // Data 和 State 需要初始化为空，确保 ParseState 不会 panic
-                Data: "{}",
+				// Data 和 State 需要初始化为空，确保 ParseState 不会 panic
+				Data: "{}",
 			}
-            emptyState, _ := emptySnapshot.ParseState() // 解析空 JSON
+			emptyState, _ := emptySnapshot.ParseState() // 解析空 JSON
 			return emptySnapshot, emptyState, nil
 		}
 		// 其他数据库错误
 		logCtx.WithError(err).Error("Failed to get latest snapshot from database repository")
 		return nil, nil, ErrInternalServer
 	}
-    // 防御性检查
-    if dbSnapshot == nil {
-         logCtx.Error("Snapshot repository returned nil snapshot without error")
-         return nil, nil, ErrInternalServer
-    }
+	// 防御性检查
+	if dbSnapshot == nil {
+		logCtx.Error("Snapshot repository returned nil snapshot without error")
+		return nil, nil, ErrInternalServer
+	}
 
 	// 3. 数据库命中，解析状态并回填缓存
 	state, parseErr := dbSnapshot.ParseState()
@@ -164,7 +163,6 @@ func (s *SnapshotService) CheckAndGenerateSnapshot(ctx context.Context, roomID u
 	return newSnapshotTime, nil
 }
 
-
 // generateSnapshot 实际执行快照生成的逻辑。
 func (s *SnapshotService) generateSnapshot(ctx context.Context, roomID uint) error {
 	logCtx := logrus.WithField("room_id", roomID)
@@ -222,13 +220,12 @@ func (s *SnapshotService) generateSnapshot(ctx context.Context, roomID uint) err
 	return nil
 }
 
-
 // --- 快照任务辅助函数 (保持私有) ---
 
 func calculateSnapshotInterval(opCountSinceLast int) time.Duration {
 	// 可以根据实际情况调整这些阈值和间隔
 	if opCountSinceLast > 100 { // 高活跃度
-		return 1 * time.Minute   // 缩短间隔
+		return 1 * time.Minute // 缩短间隔
 	} else if opCountSinceLast > 20 { // 中等活跃度
 		return 5 * time.Minute
 	} else { // 低活跃度或首次
