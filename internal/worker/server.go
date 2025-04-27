@@ -22,12 +22,13 @@ type WorkerServer struct {
 	server *asynq.Server
 	log    *logrus.Entry
 	actionRepo repository.ActionRepository // 将 actionRepo 存储在结构体中
-	hub             *hub.Hub             // <--- 新增 Hub 依赖
-	snapshotService *service.SnapshotService // <--- 新增 SnapshotService 依赖
+	hub             *hub.Hub             //  Hub 依赖
+	snapshotService *service.SnapshotService //  SnapshotService 依赖
+	stateRepo       repository.StateRepository
 }
 
 // NewWorkerServer 创建一个新的 WorkerServer 实例
-func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.ActionRepository, hub *hub.Hub,snapshotService *service.SnapshotService,logger *logrus.Logger,) *WorkerServer {
+func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.ActionRepository, hub *hub.Hub,snapshotService *service.SnapshotService,stateRepo repository.StateRepository,logger *logrus.Logger,) *WorkerServer {
 	logEntry := logger.WithField("component", "worker_server")
 
 	server := asynq.NewServer(
@@ -62,13 +63,14 @@ func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.Action
 
 	if hub == nil { panic("Hub cannot be nil for WorkerServer") }
     if snapshotService == nil { panic("SnapshotService cannot be nil for WorkerServer") }
-
+	if stateRepo == nil { panic("StateRepository cannot be nil for WorkerServer") }
 	return &WorkerServer{
 		server: server,
 		log:    logEntry,
 		actionRepo: actionRepo, // 存储 actionRepo
 		hub:             hub,             
 		snapshotService: snapshotService, 
+		stateRepo:       stateRepo,
 	}
 }
 
@@ -81,7 +83,7 @@ func (ws *WorkerServer) Start() {
 	actionPersistenceHandler := NewActionPersistenceHandler(ws.actionRepo)
 	mux.HandleFunc(tasks.TypeActionPersistence, actionPersistenceHandler.ProcessTask)
 
-	snapshotCheckHandler := NewSnapshotCheckHandler(ws.hub, ws.snapshotService) // 注入依赖
+	snapshotCheckHandler := NewSnapshotCheckHandler(ws.hub, ws.snapshotService, ws.stateRepo) // 注入依赖
 	mux.HandleFunc(tasks.TypeSnapshotPeriodicCheck, snapshotCheckHandler.ProcessTask)
 	// --- 注册结束 ---
 

@@ -58,4 +58,14 @@ type StateRepository interface {
 	// === PubSub ===
 	// PublishAction 将处理后的 Action 发布到指定房间的频道。
 	PublishAction(ctx context.Context, roomID uint, action domain.Action) error
+
+	// === Snapshot Worker State ===
+
+	// GetLastSnapshotTime 获取指定房间上次快照的时间戳 (来自 Redis)
+	// 如果没有记录，可以返回 time.Time{} 的零值和 nil 错误
+	GetLastSnapshotTime(ctx context.Context, roomID uint) (time.Time, error)
+
+	// SetLastSnapshotTime 设置指定房间上次快照的时间戳 (存储到 Redis)
+	// 可以考虑设置一个合理的过期时间，例如几天，防止无用 key 堆积
+	SetLastSnapshotTime(ctx context.Context, roomID uint, timestamp time.Time, ttl time.Duration) error
 }

@@ -15,29 +15,26 @@ import (
 	"collaborative-blackboard/internal/hub"     // 需要 Hub 获取活跃房间
 	"collaborative-blackboard/internal/service" // 需要 SnapshotService
 	// "collaborative-blackboard/internal/tasks" // 暂时不需要 tasks 包的 payload
+	"collaborative-blackboard/internal/repository"
 )
 
 // SnapshotCheckHandler 处理周期性的快照检查任务
 type SnapshotCheckHandler struct {
 	hub             *hub.Hub             // 用于获取活跃房间 ID
 	snapshotService *service.SnapshotService // 用于检查和生成快照
-	// 可以维护一个 map 来跟踪每个房间的上次快照时间 (需要并发安全)
-	// 或者将 lastSnapshotTime 存储在 Redis 中 (更健壮)
-	// 我们先用简单的内存 map (需要改进)
-	lastSnapshotTimes map[uint]time.Time
-	lastSnapshotMu  sync.Mutex // 保护 map
+	stateRepo       repository.StateRepository // <--- 新增 StateRepository 依赖
 }
 
 // NewSnapshotCheckHandler 创建 Handler 实例
-func NewSnapshotCheckHandler(hub *hub.Hub, snapshotService *service.SnapshotService) *SnapshotCheckHandler {
+func NewSnapshotCheckHandler(hub *hub.Hub, snapshotService *service.SnapshotService,stateRepo repository.StateRepository,) *SnapshotCheckHandler {
 	// 添加 nil 检查
     if hub == nil { panic("Hub cannot be nil for SnapshotCheckHandler") }
     if snapshotService == nil { panic("SnapshotService cannot be nil for SnapshotCheckHandler") }
+	if stateRepo == nil { panic("StateRepository cannot be nil for SnapshotCheckHandler") }
 	return &SnapshotCheckHandler{
 		hub:             hub,
 		snapshotService: snapshotService,
-		lastSnapshotTimes: make(map[uint]time.Time),
-        // mu 会自动初始化
+		stateRepo:       stateRepo,
 	}
 }
 
@@ -71,15 +68,19 @@ func (h *SnapshotCheckHandler) ProcessTask(ctx context.Context, t *asynq.Task) e
 			defer wg.Done()
 			roomLogCtx := logCtx.WithField("room_id", rID)
 
-			// a. 获取该房间上次快照时间 (从内存 map)
-			h.lastSnapshotMu.Lock()
-			lastTime := h.lastSnapshotTimes[rID] // 如果 key 不存在，返回 time.Time 的零值
-			h.lastSnapshotMu.Unlock()
-
-			// b. 调用 Service 检查并可能生成快照
-            // 使用带有超时的 context，避免任务卡死
-            checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // 例如 30 秒超时
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // 为每个房间检查设置超时
             defer cancel()
+
+			// --- 从 Redis 获取上次快照时间 ---
+			lastTime, err := h.stateRepo.GetLastSnapshotTime(checkCtx, rID)
+            if err != nil {
+                // 获取失败，记录错误但可能继续尝试生成（当作首次）
+                roomLogCtx.WithError(err).Error("Failed to get last snapshot time from repository")
+                lastTime = time.Time{} // 使用零值时间
+            }
+            // --- 获取结束 ---
+
+			// b. 调用 Service 检查并生成快照 
 			newLastTime, err := h.snapshotService.CheckAndGenerateSnapshot(checkCtx, rID, lastTime)
 
 			if err != nil {
@@ -90,10 +91,14 @@ func (h *SnapshotCheckHandler) ProcessTask(ctx context.Context, t *asynq.Task) e
                 errMu.Unlock()
 			} else if !newLastTime.Equal(lastTime) { // 如果时间戳更新了，说明生成了快照
                 roomLogCtx.Info("Snapshot generated or check successful, updating last snapshot time.")
-				// c. 更新内存 map 中的时间戳
-				h.lastSnapshotMu.Lock()
-				h.lastSnapshotTimes[rID] = newLastTime
-				h.lastSnapshotMu.Unlock()
+				// ---  将新时间戳存回 Redis ---
+                // 设置一个合理的 TTL，例如 7 天
+                ttl := 7 * 24 * time.Hour
+				if err := h.stateRepo.SetLastSnapshotTime(checkCtx, rID, newLastTime, ttl); err != nil {
+                    // 设置失败，只记录警告
+                    roomLogCtx.WithError(err).Warn("Failed to set last snapshot time in repository")
+                }
+                // --- 设置结束 ---
 			} else {
                  roomLogCtx.Debug("Snapshot check complete, no generation needed.")
             }

@@ -190,7 +190,7 @@ func NewApp() (*App, error) {
 
 	// 8. 初始化 Worker Server
 	log.Info("Initializing worker server...")
-	workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, hubInstance, snapshotService, log)
+	workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, hubInstance, snapshotService, stateRepo, log)
 	log.Info("Worker server initialized")
 
 	// 9. 初始化 Gin Engine 和路由

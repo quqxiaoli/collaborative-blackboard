@@ -64,6 +64,10 @@ func (r *RedisStateRepository) roomPubSubChannel(roomID uint) string {
 	return fmt.Sprintf("%sroom:%d:pubsub", r.keyPrefix, roomID)
 }
 
+func (r *RedisStateRepository) roomLastSnapshotTimeKey(roomID uint) string {
+	return fmt.Sprintf("%sroom:%d:last_snapshot_time", r.keyPrefix, roomID) // String key
+}
+
 // --- StateRepository Interface Implementation ---
 
 // GetBoardState 获取指定房间的当前完整白板状态 (来自 Redis Hash)
@@ -267,6 +271,51 @@ func (r *RedisStateRepository) PublishAction(ctx context.Context, roomID uint, a
 			"room_id":      roomID,
 		}).WithError(err).Error("Redis Publish failed")
 		return fmt.Errorf("redis: failed to publish action to channel %s: %w", channel, err)
+	}
+	return nil
+}
+
+// ---  实现 Snapshot Worker State 方法 ---
+
+// GetLastSnapshotTime 获取指定房间上次快照的时间戳 (来自 Redis)
+func (r *RedisStateRepository) GetLastSnapshotTime(ctx context.Context, roomID uint) (time.Time, error) {
+	key := r.roomLastSnapshotTimeKey(roomID)
+	// 时间戳通常存储为 Unix 时间戳 (秒或纳秒) 的字符串形式
+	timestampStr, err := r.client.Get(ctx, key).Result()
+
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			// Key 不存在，表示从未记录过，返回 time.Time 的零值
+			return time.Time{}, nil
+		}
+		// 其他 Redis 错误
+		return time.Time{}, fmt.Errorf("redis: failed to get last snapshot time for room %d from %s: %w", roomID, key, err)
+	}
+
+	// 将字符串解析为 int64 (假设存储的是 Unix 秒)
+	timestampSec, parseErr := strconv.ParseInt(timestampStr, 10, 64)
+	if parseErr != nil {
+		// Redis 中存储的值格式不正确
+		logrus.Warnf("redis: failed to parse last snapshot time '%s' for room %d from %s: %v", timestampStr, roomID, key, parseErr)
+		// 可以选择返回零值或错误
+		return time.Time{}, nil // 容错处理，下次会重新生成
+	}
+
+	// 将 Unix 秒转换为 time.Time
+	return time.Unix(timestampSec, 0), nil
+}
+
+// SetLastSnapshotTime 设置指定房间上次快照的时间戳 (存储到 Redis)
+func (r *RedisStateRepository) SetLastSnapshotTime(ctx context.Context, roomID uint, timestamp time.Time, ttl time.Duration) error {
+	key := r.roomLastSnapshotTimeKey(roomID)
+	// 将 time.Time 转换为 Unix 时间戳 (秒) 的字符串
+	timestampStr := strconv.FormatInt(timestamp.Unix(), 10)
+
+	// 使用 Set 命令写入，并设置过期时间 TTL
+	// 如果 ttl 为 0，表示不过期
+	err := r.client.Set(ctx, key, timestampStr, ttl).Err()
+	if err != nil {
+		return fmt.Errorf("redis: failed to set last snapshot time for room %d on key %s: %w", roomID, key, err)
 	}
 	return nil
 }
