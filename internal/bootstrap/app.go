@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,10 +25,11 @@ import (
 	"collaborative-blackboard/internal/infra/setup"
 	redisstate "collaborative-blackboard/internal/infra/state/redis"
 	"collaborative-blackboard/internal/middleware"
-	//"collaborative-blackboard/internal/repository" 
+
+	//"collaborative-blackboard/internal/repository"
 	"collaborative-blackboard/internal/service"
-	"collaborative-blackboard/internal/worker"
 	"collaborative-blackboard/internal/tasks"
+	"collaborative-blackboard/internal/worker"
 )
 
 // Config 结构体用于存储从环境变量或文件加载的配置
@@ -48,6 +50,7 @@ type Config struct {
 	JWTExpiryHours  int
 	AppEnv          string // 新增: 应用环境 (development/production)
 	KeyPrefix       string // 新增: Redis Key 前缀
+	WebSocketAllowedOrigins []string // 允许的 WebSocket 源列表
 }
 
 // LoadConfig 从环境变量加载配置
@@ -74,6 +77,20 @@ func LoadConfig() (*Config, error) {
 		JWTExpiryHours:  24,
 	}
 
+	// 加载 WebSocket 允许的源 (逗号分隔)
+    originsStr := os.Getenv("WEBSOCKET_ALLOWED_ORIGINS") // 例如 "http://localhost:3000,https://yourdomain.com"
+    if originsStr != "" {
+        cfg.WebSocketAllowedOrigins = strings.Split(originsStr, ",")
+        // 可以添加 TrimSpace 等处理
+        for i := range cfg.WebSocketAllowedOrigins {
+            cfg.WebSocketAllowedOrigins[i] = strings.TrimSpace(cfg.WebSocketAllowedOrigins[i])
+        }
+    } else {
+        // 如果没有配置，可以设置一个默认值（例如只允许本地开发）或不允许任何连接？
+         cfg.WebSocketAllowedOrigins = []string{"http://localhost:3000"} // 默认仅允许本地开发
+         logrus.Warn("WEBSOCKET_ALLOWED_ORIGINS not set, defaulting to localhost:3000")
+    }
+	
 	// 处理 Redis DB
 	redisDBStr := os.Getenv("REDIS_DB")
 	cfg.RedisDB, _ = strconv.Atoi(redisDBStr) // 忽略错误，默认为 0
@@ -185,7 +202,7 @@ func NewApp() (*App, error) {
 	log.Info("Initializing handlers...")
 	authHandler := httpHandler.NewAuthHandler(authService)
 	roomHandler := httpHandler.NewRoomHandler(roomService)
-	wsHandler := wsHandler.NewWebSocketHandler(hubInstance, roomService)
+	wsHandler := wsHandler.NewWebSocketHandler(hubInstance, roomService, cfg.WebSocketAllowedOrigins)
 	log.Info("Handlers initialized")
 
 	// 8. 初始化 Worker Server

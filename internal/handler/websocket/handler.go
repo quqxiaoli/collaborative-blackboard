@@ -2,8 +2,11 @@ package websocket
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	// 导入 Service, Hub, Client 定义
 	"collaborative-blackboard/internal/hub"     // 导入 Hub 包
@@ -22,7 +25,7 @@ type WebSocketHandler struct {
 }
 
 // NewWebSocketHandler 创建 WebSocketHandler 实例
-func NewWebSocketHandler(hub *hub.Hub, roomService *service.RoomService) *WebSocketHandler {
+func NewWebSocketHandler(hub *hub.Hub, roomService *service.RoomService,allowedOrigins []string) *WebSocketHandler {
 	if hub == nil {
 		panic("Hub cannot be nil for WebSocketHandler")
 	}
@@ -35,13 +38,31 @@ func NewWebSocketHandler(hub *hub.Hub, roomService *service.RoomService) *WebSoc
 		WriteBufferSize: 1024,
 		// 允许所有来源连接 (生产环境应配置具体的允许来源)
 		CheckOrigin: func(r *http.Request) bool {
-			// TODO: Implement proper origin checking for production
-			// allowedOrigin := os.Getenv("WEBSOCKET_ALLOWED_ORIGIN") or config
-			// return r.Header.Get("Origin") == allowedOrigin
-			return true // 暂时允许所有
-		},
-	}
+			origin := r.Header.Get("Origin")
+            if origin == "" {
+                 // 不允许没有 Origin 头或者 Origin 为空的请求 (除非你有特定需要)
+                logrus.Warnf("WS Handler: Connection attempt with empty Origin header from %s", r.RemoteAddr)
+                return false
+		}
+		// 解析 Origin URL 以进行更可靠的比较 (忽略 path 等)
+		originUrl, err := url.Parse(origin)
+		if err != nil {
+			logrus.Warnf("WS Handler: Failed to parse Origin header '%s': %v", origin, err)
+			return false
+		}
+		requestOrigin := fmt.Sprintf("%s://%s", originUrl.Scheme, originUrl.Host) // 标准化 Origin
 
+		// 检查请求的 Origin 是否在允许列表中
+		for _, allowed := range allowedOrigins {
+			if strings.EqualFold(requestOrigin, allowed) { // 使用 EqualFold 忽略大小写
+				return true // 允许
+			}
+		}
+		logrus.Warnf("WS Handler: Connection attempt from disallowed origin: %s", origin)
+		return false // 不在允许列表，拒绝
+		},
+		// --- 修改结束 ---
+    }
 	return &WebSocketHandler{
 		upgrader:    upgrader,
 		hub:         hub,
