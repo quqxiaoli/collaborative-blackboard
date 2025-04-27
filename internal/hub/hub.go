@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/websocket"
 	// 导入正确的路径
 	// 需要 domain.Snapshot 等
 	"collaborative-blackboard/internal/domain"
@@ -65,15 +66,15 @@ type Hub struct {
 	snapshotService *service.SnapshotService
 
 	// 新增: Redis 依赖和订阅管理
-	redisClient *redis.Client             // Redis 客户端实例
-	keyPrefix   string                    // Redis key 前缀
+	redisClient *redis.Client // Redis 客户端实例
+	keyPrefix   string        // Redis key 前缀
 	// 用于管理每个房间订阅 Goroutine 的 context cancel func
 	roomSubscriptions map[uint]context.CancelFunc
-	subMu             sync.Mutex          // 保护 roomSubscriptions map 的访问
+	subMu             sync.Mutex // 保护 roomSubscriptions map 的访问
 }
 
 // NewHub 创建并返回一个新的 Hub 实例
-func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client,redisClient *redis.Client,keyPrefix string) *Hub {
+func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client, redisClient *redis.Client, keyPrefix string) *Hub {
 	// 启动时检查依赖注入是否有效
 	if collabService == nil {
 		panic("CollaborationService cannot be nil for Hub")
@@ -83,20 +84,22 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 	}
 	if asynqClient == nil {
 		panic("Asynq Client cannot be nil for Hub")
-	} 
-	if redisClient == nil { 
-		panic("Redis client cannot be nil for Hub") 
+	}
+	if redisClient == nil {
+		panic("Redis client cannot be nil for Hub")
 	} // 检查依赖
-	if keyPrefix == "" { keyPrefix = "bb:" } // 设置默认前缀
+	if keyPrefix == "" {
+		keyPrefix = "bb:"
+	} // 设置默认前缀
 	return &Hub{
 		// 创建带缓冲区的通道，大小可根据预期负载调整
-		messageChan:     make(chan HubMessage, 512),
-		asynqClient:     asynqClient, // 存储注入的 client
-		rooms:           make(map[uint]map[*Client]bool),
-		collabService:   collabService,
-		snapshotService: snapshotService,
-		redisClient:       redisClient, // 存储依赖
-		keyPrefix:         keyPrefix,   // 存储依赖
+		messageChan:       make(chan HubMessage, 512),
+		asynqClient:       asynqClient, // 存储注入的 client
+		rooms:             make(map[uint]map[*Client]bool),
+		collabService:     collabService,
+		snapshotService:   snapshotService,
+		redisClient:       redisClient,                       // 存储依赖
+		keyPrefix:         keyPrefix,                         // 存储依赖
 		roomSubscriptions: make(map[uint]context.CancelFunc), // 初始化 map
 	}
 }
@@ -106,6 +109,17 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 func (h *Hub) Run() {
 	log := logrus.WithField("component", "hub")
 	log.Info("Hub is running...")
+
+	// --- 启动定期的客户端清理 Goroutine ---
+    cleanupInterval := 1 * time.Minute // 清理间隔1 分钟 
+    // 创建一个新的 context 用于控制清理 goroutine 的生命周期
+    // 注意：这里的 ctx 不同于 roomSubscribeLoop 的 ctx
+    //cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+    //defer cleanupCancel() // 确保在 Hub Run 退出时也停止清理 (虽然 Run 通常不退出)
+    // 或者直接在 goroutine 内部处理退出信号 
+    go h.runClientCleanupLoop(cleanupInterval)
+    log.Infof("Client cleanup routine started (interval: %v)", cleanupInterval)
+    // --- 清理启动结束 ---
 
 	// 持续从 messageChan 读取并处理消息
 	for msg := range h.messageChan {
@@ -192,7 +206,9 @@ func (h *Hub) unregisterClient(client *Client) {
 			logCtx.Debug("Client removed from room map")
 			select {
 			case <-client.send: // 检查是否已关闭
-			default: close(client.send); logCtx.Info("Client send channel closed")
+			default:
+				close(client.send)
+				logCtx.Info("Client send channel closed")
 			}
 
 			// 检查房间是否变空
@@ -201,8 +217,12 @@ func (h *Hub) unregisterClient(client *Client) {
 				logCtx.Info("Room empty, removed from Hub")
 				shouldStopSubscription = true // 标记需要停止此房间的订阅
 			}
-		} else { logCtx.Warn("Client not found in room during unregister") }
-	} else { logCtx.Warn("Room not found during client unregister") }
+		} else {
+			logCtx.Warn("Client not found in room during unregister")
+		}
+	} else {
+		logCtx.Warn("Room not found during client unregister")
+	}
 	h.roomsMu.Unlock() // 尽快释放锁
 	logCtx.Info("Client unregistered from Hub")
 
@@ -212,6 +232,103 @@ func (h *Hub) unregisterClient(client *Client) {
 		h.stopRoomSubscription(roomID) // 调用停止订阅的方法
 	}
 	// --- 订阅逻辑结束 ---
+}
+
+// runClientCleanupLoop 启动一个定时的循环来执行客户端清理检查
+func (h *Hub) runClientCleanupLoop(interval time.Duration) {
+	// 创建一个定时器
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop() // 确保定时器停止
+
+	logCtx := logrus.WithField("component", "client_cleanup")
+	logCtx.Info("Client cleanup loop running...")
+
+	// 循环执行清理检查
+	for {
+		select {
+		case <-ticker.C: // 等待定时器触发
+			h.performClientCleanup()
+		// TODO: 添加一个退出信号通道，以便在 Hub 关闭时优雅停止这个 Goroutine
+		// case <-h.shutdownCleanupChan:
+		//     logCtx.Info("Received shutdown signal, stopping cleanup loop.")
+		//     return
+		}
+	}
+}
+
+// performClientCleanup 执行一次客户端清理检查
+func (h *Hub) performClientCleanup() {
+	logCtx := logrus.WithField("operation", "performClientCleanup")
+	logCtx.Debug("Starting client cleanup check...")
+
+	// 1. 获取当前所有客户端的列表 (并发安全)
+	h.roomsMu.RLock() // 加读锁以安全读取 rooms map
+	// 创建一个足够大的 slice 来存储所有 client 指针
+	allClients := make([]*Client, 0, len(h.rooms)*2) // 预估容量
+	for _, roomClients := range h.rooms {
+		for client := range roomClients {
+			allClients = append(allClients, client)
+		}
+	}
+	h.roomsMu.RUnlock() // 尽快释放读锁
+
+	// 如果没有客户端，直接返回
+	if len(allClients) == 0 {
+		logCtx.Debug("No clients connected, skipping cleanup.")
+		return
+	}
+
+	logCtx.Infof("Checking %d clients for inactivity...", len(allClients))
+	// 2. 遍历客户端并尝试发送 Ping
+	clientsToUnregister := make([]*Client, 0) // 收集需要注销的客户端
+	pingTimeout := 5 * time.Second          // 为 Ping 写入设置一个较短的超时
+
+	for _, client := range allClients {
+		clientLogCtx := logCtx.WithFields(logrus.Fields{"room_id": client.RoomID(), "user_id": client.UserID()})
+
+		// a. 设置写入超时
+		err := client.conn.SetWriteDeadline(time.Now().Add(pingTimeout))
+		if err != nil {
+			// 设置超时失败通常意味着连接已经有问题
+			clientLogCtx.WithError(err).Warn("Cleanup: Failed to set write deadline for ping, assuming inactive.")
+			clientsToUnregister = append(clientsToUnregister, client)
+			continue // 处理下一个
+		}
+
+		// b. 发送 Ping 控制帧
+		// WriteMessage 对于控制帧是并发安全的
+		if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			// 发送 Ping 失败，连接很可能已断开
+			clientLogCtx.WithError(err).Warn("Cleanup: Failed to send ping message, marking client for unregister.")
+			clientsToUnregister = append(clientsToUnregister, client)
+            // 注意：这里不需要关闭 conn，unregister 流程会关闭
+		} else {
+			// Ping 发送成功
+			// clientLogCtx.Debug("Cleanup: Ping sent successfully.")
+			// 清除写入超时（虽然下一个 select 循环或 WritePump 会覆盖，但保持良好习惯）
+			_ = client.conn.SetWriteDeadline(time.Time{})
+		}
+	}
+
+	// 3. 处理需要注销的客户端
+	if len(clientsToUnregister) > 0 {
+		logCtx.Infof("Found %d potentially inactive clients to unregister.", len(clientsToUnregister))
+		for _, client := range clientsToUnregister {
+			// 将注销请求发送到 Hub 的主处理通道，保证线程安全
+			unregisterMsg := HubMessage{Type: "unregister", Client: client}
+			// 使用非阻塞发送，如果 Hub 处理不过来，暂时忽略（理论上不应发生）
+			if !h.QueueMessage(unregisterMsg) { // 使用 QueueMessage
+				logCtx.WithFields(logrus.Fields{"room_id": client.RoomID(), "user_id": client.UserID()}).Error("Cleanup: Hub message channel full, failed to send unregister request!")
+                // 如果通道满了，可能 Hub 负载很高，或者有问题。
+                // 极端情况下，可以直接关闭连接，但可能不安全。
+                // client.CloseConn()
+			} else {
+                 logCtx.WithFields(logrus.Fields{"room_id": client.RoomID(), "user_id": client.UserID()}).Info("Cleanup: Unregister request sent to Hub.")
+            }
+		}
+	} else {
+		logCtx.Debug("Client cleanup check complete, no inactive clients found by ping failure.")
+	}
 }
 
 // sendInitialSnapshot 异步获取并发送快照给新连接的客户端
@@ -292,7 +409,6 @@ func (h *Hub) handleClientAction(msg HubMessage) {
 	if shouldBroadcast && processedAction != nil {
 		logCtx.WithField("action_version", processedAction.Version).Info("Action processed by service and published via repository, queuing persistence task...")
 
-
 		// --- 修改：使用 Asynq 将持久化任务入队 ---
 		// 1. 创建任务 Payload
 		taskPayloadBytes, err := tasks.NewActionPersistenceTask(*processedAction)
@@ -361,18 +477,17 @@ func (h *Hub) stopRoomSubscription(roomID uint) {
 
 // stopAllSubscriptions 在 Hub 关闭时停止所有房间的订阅
 func (h *Hub) StopAllSubscriptions() {
-    h.subMu.Lock()
-    defer h.subMu.Unlock()
-    logrus.Info("Hub shutting down, stopping all room subscriptions...")
-    count := 0
-    for roomID, cancel := range h.roomSubscriptions {
-        cancel() // 通知 Goroutine 退出
-        delete(h.roomSubscriptions, roomID)
-        count++
-    }
-    logrus.Infof("Stopped %d room subscriptions.", count)
+	h.subMu.Lock()
+	defer h.subMu.Unlock()
+	logrus.Info("Hub shutting down, stopping all room subscriptions...")
+	count := 0
+	for roomID, cancel := range h.roomSubscriptions {
+		cancel() // 通知 Goroutine 退出
+		delete(h.roomSubscriptions, roomID)
+		count++
+	}
+	logrus.Infof("Stopped %d room subscriptions.", count)
 }
-
 
 // roomSubscribeLoop 是每个房间订阅 Goroutine 的主循环体
 func (h *Hub) roomSubscribeLoop(ctx context.Context, roomID uint, logCtx *logrus.Entry) {
@@ -390,10 +505,10 @@ func (h *Hub) roomSubscribeLoop(ctx context.Context, roomID uint, logCtx *logrus
 			logCtx.Info("Subscription cancelled or Redis closed before confirmation.")
 		}
 		// 确保从 Hub 的 map 中移除 (即使 stop 被调用，也做一次检查)
-        h.subMu.Lock()
-        delete(h.roomSubscriptions, roomID)
-        h.subMu.Unlock()
-        _ = pubsub.Close()
+		h.subMu.Lock()
+		delete(h.roomSubscriptions, roomID)
+		h.subMu.Unlock()
+		_ = pubsub.Close()
 		return
 	}
 	logCtx.Infof("Successfully subscribed to Redis channel %s", channel)
@@ -409,10 +524,10 @@ func (h *Hub) roomSubscribeLoop(ctx context.Context, roomID uint, logCtx *logrus
 		if err := pubsub.Close(); err != nil {
 			logCtx.WithError(err).Warn("Error closing pubsub connection on exit")
 		}
-        // 确保从 Hub map 中移除
-        h.subMu.Lock()
-        delete(h.roomSubscriptions, roomID)
-        h.subMu.Unlock()
+		// 确保从 Hub map 中移除
+		h.subMu.Lock()
+		delete(h.roomSubscriptions, roomID)
+		h.subMu.Unlock()
 		logCtx.Info("Subscription loop stopped.")
 	}()
 
