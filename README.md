@@ -150,7 +150,7 @@ sequenceDiagram
 **先决条件:**
 
 *   Go (版本 >= 1.18)
-*   Docker 和 Docker Compose (推荐)
+*   Docker 和 Docker Compose (推荐/但还未实现)
 *   Make (可选)
 
 **配置:**
@@ -182,14 +182,13 @@ sequenceDiagram
     REDIS_KEY_PREFIX=bb:
     CORS_ALLOWED_ORIGIN=http://localhost:3000 # 根据你的前端地址修改
     ```
-    *(建议创建一个 `.env.example` 文件作为模板)*
 
-**启动依赖 (使用 Docker Compose - 推荐):**
+**启动依赖 (使用 Docker Compose - 推荐/还未实现):**
 
 ```bash
 docker-compose up -d # 启动数据库和 Redis
 ```
-(你需要提供一个 docker-compose.yml 文件，包含 MySQL/PostgreSQL 和 Redis 服务)
+(需要一个 docker-compose.yml 文件，包含 MySQL/PostgreSQL 和 Redis 服务)
 
 **安装 Go 依赖:**
 
