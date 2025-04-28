@@ -39,6 +39,12 @@ const (
 	maxMessageSize = 1024 // 增加到 1024 字节，根据需要调整
 )
 
+type ErrorMessage struct {
+    Type    string `json:"type"`    // 固定为 "error"
+    Message string `json:"message"` // 错误描述信息
+    // Code    int    `json:"code,omitempty"` // 可选的错误码
+}
+
 // HubMessage 定义了在 Hub 内部通道传递的消息类型
 type HubMessage struct {
 	Type    string  // "register", "unregister", "action"
@@ -376,13 +382,21 @@ func (h *Hub) sendInitialSnapshot(client *Client) {
 	snapshot, boardState, err := h.snapshotService.GetSnapshotForClient(ctx, client.RoomID())
 	if err != nil {
 		logCtx.WithError(err).Error("Failed to get snapshot data from service")
-		// 考虑向客户端发送错误信息
-		errorMsg := `{"type": "error", "message": "Failed to load initial board state"}`
-		// 尝试发送错误消息，忽略发送通道满的情况
-		select {
-		case client.send <- []byte(errorMsg):
-		default:
-		}
+		// --- 发送错误消息给客户端 ---
+        errMsgPayload := ErrorMessage{
+            Type:    "error",
+            Message: "Failed to load initial board state. Please try refreshing.", // 友好的错误信息
+        }
+        errMsgBytes, _ := json.Marshal(errMsgPayload) // 忽略 marshal 错误
+        if errMsgBytes != nil {
+            select {
+            case client.send <- errMsgBytes:
+                 logCtx.Warn("Sent snapshot loading error message to client")
+            default:
+                 logCtx.Warn("Client send channel full when trying to send snapshot error")
+            }
+        }
+        // --- 发送结束 ---
 		return
 	}
 
@@ -424,10 +438,24 @@ func (h *Hub) handleClientAction(msg HubMessage) {
 
 	if err != nil {
 		logCtx.WithError(err).Error("Error processing action in service")
-		// TODO: 向发送者客户端 (msg.Client) 发送错误消息
-		// errorPayload := map[string]string{"type": "error", "message": fmt.Sprintf("Action failed: %s", err.Error())}
-		// errorBytes, _ := json.Marshal(errorPayload)
-		// select { case msg.Client.send <- errorBytes: default: }
+		// --- 发送错误消息给发送者 ---
+        errMsgPayload := ErrorMessage{
+            Type:    "error",
+            Message: fmt.Sprintf("Failed to process your action: %s", err.Error()), // 可以包含一些错误细节
+        }
+         // 注意：我们需要原始的 Client 对象来发送
+        if msg.Client != nil { // 确保 Client 存在
+            errMsgBytes, _ := json.Marshal(errMsgPayload)
+            if errMsgBytes != nil {
+                 select {
+                 case msg.Client.send <- errMsgBytes:
+                     logCtx.Warn("Sent action processing error message to client")
+                 default:
+                     logCtx.Warn("Client send channel full when trying to send action error")
+                 }
+            }
+        }
+        // --- 发送结束 ---
 		return
 	}
 
