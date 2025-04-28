@@ -98,7 +98,7 @@ sequenceDiagram
     Note over Hub Subscriber (Room X): roomSubscribeLoop 运行中
     Hub Subscriber (Room X)->>Client B: client.send <- action (放入通道)
     Note over Client B,Hub Subscriber (Room X): writePump 将数据发送给 Client B
-    Client B->>-Client B: 更新本地白板
+    Client B->Client B: 更新本地白板
 ```
 
 ```mermaid
