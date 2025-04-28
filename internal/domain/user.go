@@ -6,9 +6,9 @@ import "time"
 // User 表示应用程序中的用户。
 type User struct {
 	ID        uint      `gorm:"primaryKey"`                // 用户唯一标识符 (主键)
-	Username  string    `gorm:"uniqueIndex:idx_username,length:191;not null"`      // 用户名，必须唯一且不能为空 (添加 uniqueIndex 以提高查询性能)
-	Password  string    `gorm:"not null"`                  // 存储的是哈希后的密码，不能为空
-	Email     string    `gorm:"uniqueIndex:idx_email,length:191"`               // 用户邮箱，唯一 (可选)
+	Username  string    `gorm:"type:varchar(191);uniqueIndex:idx_username;not null"`
+	Password  string    `gorm:"type:text;not null"`                  // 存储的是哈希后的密码，不能为空
+	Email     string    `gorm:"type:varchar(191);uniqueIndex:idx_email"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`            // 用户记录创建时间 (GORM 自动填充)
 	UpdatedAt time.Time `gorm:"autoUpdateTime"`            // 用户记录最后更新时间 (GORM 自动填充, 可选添加)
 }

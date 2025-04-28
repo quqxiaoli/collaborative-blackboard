@@ -1,5 +1,40 @@
 
 
+--- 文件: cmd/server/main.go ---
+
+package main
+
+import (
+	//"context"
+	"os"
+	"os/signal"
+	"syscall"
+
+	// 导入 bootstrap 包
+	"collaborative-blackboard/internal/bootstrap"
+	"github.com/sirupsen/logrus" // 仍然需要 logrus
+)
+
+func main() {
+	// 初始化并运行 App
+	app, err := bootstrap.NewApp()
+	if err != nil {
+		logrus.Fatalf("Failed to initialize application: %v", err)
+	}
+
+	// 启动应用组件
+	app.Start()
+
+	// 设置优雅关闭
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	logrus.Info("Shutdown signal received...")
+
+	// 关闭应用
+	app.Shutdown()
+}
+
 --- 文件: internal/domain/board.go ---
 
 package domain
@@ -477,8 +512,11 @@ package websocket
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	// 导入 Service, Hub, Client 定义
 	"collaborative-blackboard/internal/hub"     // 导入 Hub 包
@@ -497,7 +535,7 @@ type WebSocketHandler struct {
 }
 
 // NewWebSocketHandler 创建 WebSocketHandler 实例
-func NewWebSocketHandler(hub *hub.Hub, roomService *service.RoomService) *WebSocketHandler {
+func NewWebSocketHandler(hub *hub.Hub, roomService *service.RoomService,allowedOrigins []string) *WebSocketHandler {
 	if hub == nil {
 		panic("Hub cannot be nil for WebSocketHandler")
 	}
@@ -510,13 +548,31 @@ func NewWebSocketHandler(hub *hub.Hub, roomService *service.RoomService) *WebSoc
 		WriteBufferSize: 1024,
 		// 允许所有来源连接 (生产环境应配置具体的允许来源)
 		CheckOrigin: func(r *http.Request) bool {
-			// TODO: Implement proper origin checking for production
-			// allowedOrigin := os.Getenv("WEBSOCKET_ALLOWED_ORIGIN") or config
-			// return r.Header.Get("Origin") == allowedOrigin
-			return true // 暂时允许所有
-		},
-	}
+			origin := r.Header.Get("Origin")
+            if origin == "" {
+                 // 不允许没有 Origin 头或者 Origin 为空的请求 (除非你有特定需要)
+                logrus.Warnf("WS Handler: Connection attempt with empty Origin header from %s", r.RemoteAddr)
+                return false
+		}
+		// 解析 Origin URL 以进行更可靠的比较 (忽略 path 等)
+		originUrl, err := url.Parse(origin)
+		if err != nil {
+			logrus.Warnf("WS Handler: Failed to parse Origin header '%s': %v", origin, err)
+			return false
+		}
+		requestOrigin := fmt.Sprintf("%s://%s", originUrl.Scheme, originUrl.Host) // 标准化 Origin
 
+		// 检查请求的 Origin 是否在允许列表中
+		for _, allowed := range allowedOrigins {
+			if strings.EqualFold(requestOrigin, allowed) { // 使用 EqualFold 忽略大小写
+				return true // 允许
+			}
+		}
+		logrus.Warnf("WS Handler: Connection attempt from disallowed origin: %s", origin)
+		return false // 不在允许列表，拒绝
+		},
+		// --- 修改结束 ---
+    }
 	return &WebSocketHandler{
 		upgrader:    upgrader,
 		hub:         hub,
@@ -629,9 +685,12 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/websocket"
+
 	// 导入正确的路径
 	// 需要 domain.Snapshot 等
 	"collaborative-blackboard/internal/domain"
+	"collaborative-blackboard/internal/repository"
 	"collaborative-blackboard/internal/service"
 	"collaborative-blackboard/internal/tasks" // 导入任务定义包
 
@@ -655,6 +714,12 @@ const (
 	// Maximum message size allowed from peer.
 	maxMessageSize = 1024 // 增加到 1024 字节，根据需要调整
 )
+
+type ErrorMessage struct {
+    Type    string `json:"type"`    // 固定为 "error"
+    Message string `json:"message"` // 错误描述信息
+    // Code    int    `json:"code,omitempty"` // 可选的错误码
+}
 
 // HubMessage 定义了在 Hub 内部通道传递的消息类型
 type HubMessage struct {
@@ -685,15 +750,17 @@ type Hub struct {
 	snapshotService *service.SnapshotService
 
 	// 新增: Redis 依赖和订阅管理
-	redisClient *redis.Client             // Redis 客户端实例
-	keyPrefix   string                    // Redis key 前缀
+	redisClient *redis.Client // Redis 客户端实例
+	keyPrefix   string        // Redis key 前缀
 	// 用于管理每个房间订阅 Goroutine 的 context cancel func
 	roomSubscriptions map[uint]context.CancelFunc
-	subMu             sync.Mutex          // 保护 roomSubscriptions map 的访问
+	subMu             sync.Mutex // 保护 roomSubscriptions map 的访问
+
+	stateRepo repository.StateRepository
 }
 
 // NewHub 创建并返回一个新的 Hub 实例
-func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client,redisClient *redis.Client,keyPrefix string) *Hub {
+func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client, redisClient *redis.Client, keyPrefix string,stateRepo repository.StateRepository,) *Hub {
 	// 启动时检查依赖注入是否有效
 	if collabService == nil {
 		panic("CollaborationService cannot be nil for Hub")
@@ -703,21 +770,27 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 	}
 	if asynqClient == nil {
 		panic("Asynq Client cannot be nil for Hub")
+	}
+	if redisClient == nil {
+		panic("Redis client cannot be nil for Hub")
 	} 
-	if redisClient == nil { 
-		panic("Redis client cannot be nil for Hub") 
-	} // 检查依赖
-	if keyPrefix == "" { keyPrefix = "bb:" } // 设置默认前缀
+	if stateRepo == nil { 
+		panic("StateRepository cannot be nil for Hub") 
+	}
+	if keyPrefix == "" {
+		keyPrefix = "bb:"
+	} // 设置默认前缀
 	return &Hub{
 		// 创建带缓冲区的通道，大小可根据预期负载调整
-		messageChan:     make(chan HubMessage, 512),
-		asynqClient:     asynqClient, // 存储注入的 client
-		rooms:           make(map[uint]map[*Client]bool),
-		collabService:   collabService,
-		snapshotService: snapshotService,
-		redisClient:       redisClient, // 存储依赖
-		keyPrefix:         keyPrefix,   // 存储依赖
+		messageChan:       make(chan HubMessage, 512),
+		asynqClient:       asynqClient, // 存储注入的 client
+		rooms:             make(map[uint]map[*Client]bool),
+		collabService:     collabService,
+		snapshotService:   snapshotService,
+		redisClient:       redisClient,                       // 存储依赖
+		keyPrefix:         keyPrefix,                         // 存储依赖
 		roomSubscriptions: make(map[uint]context.CancelFunc), // 初始化 map
+		stateRepo: stateRepo,
 	}
 }
 
@@ -726,6 +799,17 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 func (h *Hub) Run() {
 	log := logrus.WithField("component", "hub")
 	log.Info("Hub is running...")
+
+	// --- 启动定期的客户端清理 Goroutine ---
+    cleanupInterval := 1 * time.Minute // 清理间隔1 分钟 
+    // 创建一个新的 context 用于控制清理 goroutine 的生命周期
+    // 注意：这里的 ctx 不同于 roomSubscribeLoop 的 ctx
+    //cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+    //defer cleanupCancel() // 确保在 Hub Run 退出时也停止清理 (虽然 Run 通常不退出)
+    // 或者直接在 goroutine 内部处理退出信号 
+    go h.runClientCleanupLoop(cleanupInterval)
+    log.Infof("Client cleanup routine started (interval: %v)", cleanupInterval)
+    // --- 清理启动结束 ---
 
 	// 持续从 messageChan 读取并处理消息
 	for msg := range h.messageChan {
@@ -804,6 +888,7 @@ func (h *Hub) unregisterClient(client *Client) {
 		"action":  "unregisterClient",
 	})
 	shouldStopSubscription := false // 标记是否需要停止订阅
+	shouldCleanupRoomState := false // 标记是否需要清理房间状态
 
 	h.roomsMu.Lock()
 	if roomClients, roomExists := h.rooms[roomID]; roomExists {
@@ -812,7 +897,9 @@ func (h *Hub) unregisterClient(client *Client) {
 			logCtx.Debug("Client removed from room map")
 			select {
 			case <-client.send: // 检查是否已关闭
-			default: close(client.send); logCtx.Info("Client send channel closed")
+			default:
+				close(client.send)
+				logCtx.Info("Client send channel closed")
 			}
 
 			// 检查房间是否变空
@@ -820,9 +907,14 @@ func (h *Hub) unregisterClient(client *Client) {
 				delete(h.rooms, roomID) // 从 Hub 中移除房间
 				logCtx.Info("Room empty, removed from Hub")
 				shouldStopSubscription = true // 标记需要停止此房间的订阅
+				shouldCleanupRoomState = true // 标记需要清理房间状态
 			}
-		} else { logCtx.Warn("Client not found in room during unregister") }
-	} else { logCtx.Warn("Room not found during client unregister") }
+		} else {
+			logCtx.Warn("Client not found in room during unregister")
+		}
+	} else {
+		logCtx.Warn("Room not found during client unregister")
+	}
 	h.roomsMu.Unlock() // 尽快释放锁
 	logCtx.Info("Client unregistered from Hub")
 
@@ -832,6 +924,120 @@ func (h *Hub) unregisterClient(client *Client) {
 		h.stopRoomSubscription(roomID) // 调用停止订阅的方法
 	}
 	// --- 订阅逻辑结束 ---
+
+	// --- 如果房间空了，异步清理 Redis 状态 ---
+    if shouldCleanupRoomState {
+		logCtx.Info("Room is empty, triggering Redis state cleanup...")
+		go func(rID uint) {
+			// 使用后台 context
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // 设置超时
+			defer cancel()
+			if err := h.stateRepo.CleanupRoomState(cleanupCtx, rID); err != nil {
+				// 只记录错误，不影响主流程
+				logrus.WithError(err).Errorf("Failed to cleanup Redis state for room %d", rID)
+			} else {
+				logrus.Infof("Successfully cleaned up Redis state for empty room %d", rID)
+			}
+		}(roomID)
+   }
+   // --- 清理逻辑结束 ---
+}
+
+// runClientCleanupLoop 启动一个定时的循环来执行客户端清理检查
+func (h *Hub) runClientCleanupLoop(interval time.Duration) {
+	// 创建一个定时器
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop() // 确保定时器停止
+
+	logCtx := logrus.WithField("component", "client_cleanup")
+	logCtx.Info("Client cleanup loop running...")
+
+	// 循环执行清理检查
+	for {
+		select {
+		case <-ticker.C: // 等待定时器触发
+			h.performClientCleanup()
+		// TODO: 添加一个退出信号通道，以便在 Hub 关闭时优雅停止这个 Goroutine
+		// case <-h.shutdownCleanupChan:
+		//     logCtx.Info("Received shutdown signal, stopping cleanup loop.")
+		//     return
+		}
+	}
+}
+
+// performClientCleanup 执行一次客户端清理检查
+func (h *Hub) performClientCleanup() {
+	logCtx := logrus.WithField("operation", "performClientCleanup")
+	logCtx.Debug("Starting client cleanup check...")
+
+	// 1. 获取当前所有客户端的列表 (并发安全)
+	h.roomsMu.RLock() // 加读锁以安全读取 rooms map
+	// 创建一个足够大的 slice 来存储所有 client 指针
+	allClients := make([]*Client, 0, len(h.rooms)*2) // 预估容量
+	for _, roomClients := range h.rooms {
+		for client := range roomClients {
+			allClients = append(allClients, client)
+		}
+	}
+	h.roomsMu.RUnlock() // 尽快释放读锁
+
+	// 如果没有客户端，直接返回
+	if len(allClients) == 0 {
+		logCtx.Debug("No clients connected, skipping cleanup.")
+		return
+	}
+
+	logCtx.Infof("Checking %d clients for inactivity...", len(allClients))
+	// 2. 遍历客户端并尝试发送 Ping
+	clientsToUnregister := make([]*Client, 0) // 收集需要注销的客户端
+	pingTimeout := 5 * time.Second          // 为 Ping 写入设置一个较短的超时
+
+	for _, client := range allClients {
+		clientLogCtx := logCtx.WithFields(logrus.Fields{"room_id": client.RoomID(), "user_id": client.UserID()})
+
+		// a. 设置写入超时
+		err := client.conn.SetWriteDeadline(time.Now().Add(pingTimeout))
+		if err != nil {
+			// 设置超时失败通常意味着连接已经有问题
+			clientLogCtx.WithError(err).Warn("Cleanup: Failed to set write deadline for ping, assuming inactive.")
+			clientsToUnregister = append(clientsToUnregister, client)
+			continue // 处理下一个
+		}
+
+		// b. 发送 Ping 控制帧
+		// WriteMessage 对于控制帧是并发安全的
+		if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			// 发送 Ping 失败，连接很可能已断开
+			clientLogCtx.WithError(err).Warn("Cleanup: Failed to send ping message, marking client for unregister.")
+			clientsToUnregister = append(clientsToUnregister, client)
+            // 注意：这里不需要关闭 conn，unregister 流程会关闭
+		} else {
+			// Ping 发送成功
+			// clientLogCtx.Debug("Cleanup: Ping sent successfully.")
+			// 清除写入超时（虽然下一个 select 循环或 WritePump 会覆盖，但保持良好习惯）
+			_ = client.conn.SetWriteDeadline(time.Time{})
+		}
+	}
+
+	// 3. 处理需要注销的客户端
+	if len(clientsToUnregister) > 0 {
+		logCtx.Infof("Found %d potentially inactive clients to unregister.", len(clientsToUnregister))
+		for _, client := range clientsToUnregister {
+			// 将注销请求发送到 Hub 的主处理通道，保证线程安全
+			unregisterMsg := HubMessage{Type: "unregister", Client: client}
+			// 使用非阻塞发送，如果 Hub 处理不过来，暂时忽略（理论上不应发生）
+			if !h.QueueMessage(unregisterMsg) { // 使用 QueueMessage
+				logCtx.WithFields(logrus.Fields{"room_id": client.RoomID(), "user_id": client.UserID()}).Error("Cleanup: Hub message channel full, failed to send unregister request!")
+                // 如果通道满了，可能 Hub 负载很高，或者有问题。
+                // 极端情况下，可以直接关闭连接，但可能不安全。
+                // client.CloseConn()
+			} else {
+                 logCtx.WithFields(logrus.Fields{"room_id": client.RoomID(), "user_id": client.UserID()}).Info("Cleanup: Unregister request sent to Hub.")
+            }
+		}
+	} else {
+		logCtx.Debug("Client cleanup check complete, no inactive clients found by ping failure.")
+	}
 }
 
 // sendInitialSnapshot 异步获取并发送快照给新连接的客户端
@@ -852,13 +1058,21 @@ func (h *Hub) sendInitialSnapshot(client *Client) {
 	snapshot, boardState, err := h.snapshotService.GetSnapshotForClient(ctx, client.RoomID())
 	if err != nil {
 		logCtx.WithError(err).Error("Failed to get snapshot data from service")
-		// 考虑向客户端发送错误信息
-		errorMsg := `{"type": "error", "message": "Failed to load initial board state"}`
-		// 尝试发送错误消息，忽略发送通道满的情况
-		select {
-		case client.send <- []byte(errorMsg):
-		default:
-		}
+		// --- 发送错误消息给客户端 ---
+        errMsgPayload := ErrorMessage{
+            Type:    "error",
+            Message: "Failed to load initial board state. Please try refreshing.", // 友好的错误信息
+        }
+        errMsgBytes, _ := json.Marshal(errMsgPayload) // 忽略 marshal 错误
+        if errMsgBytes != nil {
+            select {
+            case client.send <- errMsgBytes:
+                 logCtx.Warn("Sent snapshot loading error message to client")
+            default:
+                 logCtx.Warn("Client send channel full when trying to send snapshot error")
+            }
+        }
+        // --- 发送结束 ---
 		return
 	}
 
@@ -900,10 +1114,24 @@ func (h *Hub) handleClientAction(msg HubMessage) {
 
 	if err != nil {
 		logCtx.WithError(err).Error("Error processing action in service")
-		// TODO: 向发送者客户端 (msg.Client) 发送错误消息
-		// errorPayload := map[string]string{"type": "error", "message": fmt.Sprintf("Action failed: %s", err.Error())}
-		// errorBytes, _ := json.Marshal(errorPayload)
-		// select { case msg.Client.send <- errorBytes: default: }
+		// --- 发送错误消息给发送者 ---
+        errMsgPayload := ErrorMessage{
+            Type:    "error",
+            Message: fmt.Sprintf("Failed to process your action: %s", err.Error()), // 可以包含一些错误细节
+        }
+         // 注意：我们需要原始的 Client 对象来发送
+        if msg.Client != nil { // 确保 Client 存在
+            errMsgBytes, _ := json.Marshal(errMsgPayload)
+            if errMsgBytes != nil {
+                 select {
+                 case msg.Client.send <- errMsgBytes:
+                     logCtx.Warn("Sent action processing error message to client")
+                 default:
+                     logCtx.Warn("Client send channel full when trying to send action error")
+                 }
+            }
+        }
+        // --- 发送结束 ---
 		return
 	}
 
@@ -911,7 +1139,6 @@ func (h *Hub) handleClientAction(msg HubMessage) {
 	// Hub 不再需要调用 broadcast 方法来广播 Action
 	if shouldBroadcast && processedAction != nil {
 		logCtx.WithField("action_version", processedAction.Version).Info("Action processed by service and published via repository, queuing persistence task...")
-
 
 		// --- 修改：使用 Asynq 将持久化任务入队 ---
 		// 1. 创建任务 Payload
@@ -981,18 +1208,17 @@ func (h *Hub) stopRoomSubscription(roomID uint) {
 
 // stopAllSubscriptions 在 Hub 关闭时停止所有房间的订阅
 func (h *Hub) StopAllSubscriptions() {
-    h.subMu.Lock()
-    defer h.subMu.Unlock()
-    logrus.Info("Hub shutting down, stopping all room subscriptions...")
-    count := 0
-    for roomID, cancel := range h.roomSubscriptions {
-        cancel() // 通知 Goroutine 退出
-        delete(h.roomSubscriptions, roomID)
-        count++
-    }
-    logrus.Infof("Stopped %d room subscriptions.", count)
+	h.subMu.Lock()
+	defer h.subMu.Unlock()
+	logrus.Info("Hub shutting down, stopping all room subscriptions...")
+	count := 0
+	for roomID, cancel := range h.roomSubscriptions {
+		cancel() // 通知 Goroutine 退出
+		delete(h.roomSubscriptions, roomID)
+		count++
+	}
+	logrus.Infof("Stopped %d room subscriptions.", count)
 }
-
 
 // roomSubscribeLoop 是每个房间订阅 Goroutine 的主循环体
 func (h *Hub) roomSubscribeLoop(ctx context.Context, roomID uint, logCtx *logrus.Entry) {
@@ -1010,10 +1236,10 @@ func (h *Hub) roomSubscribeLoop(ctx context.Context, roomID uint, logCtx *logrus
 			logCtx.Info("Subscription cancelled or Redis closed before confirmation.")
 		}
 		// 确保从 Hub 的 map 中移除 (即使 stop 被调用，也做一次检查)
-        h.subMu.Lock()
-        delete(h.roomSubscriptions, roomID)
-        h.subMu.Unlock()
-        _ = pubsub.Close()
+		h.subMu.Lock()
+		delete(h.roomSubscriptions, roomID)
+		h.subMu.Unlock()
+		_ = pubsub.Close()
 		return
 	}
 	logCtx.Infof("Successfully subscribed to Redis channel %s", channel)
@@ -1029,10 +1255,10 @@ func (h *Hub) roomSubscribeLoop(ctx context.Context, roomID uint, logCtx *logrus
 		if err := pubsub.Close(); err != nil {
 			logCtx.WithError(err).Warn("Error closing pubsub connection on exit")
 		}
-        // 确保从 Hub map 中移除
-        h.subMu.Lock()
-        delete(h.roomSubscriptions, roomID)
-        h.subMu.Unlock()
+		// 确保从 Hub map 中移除
+		h.subMu.Lock()
+		delete(h.roomSubscriptions, roomID)
+		h.subMu.Unlock()
 		logCtx.Info("Subscription loop stopped.")
 	}()
 
@@ -1095,6 +1321,20 @@ func (h *Hub) QueueMessage(msg HubMessage) bool {
 		}).Warn("Hub message channel full, dropping message")
 		return false // 发送失败
 	}
+}
+
+// --- 新增: 获取活跃房间 ID 的方法 ---
+// GetActiveRoomIDs 返回当前 Hub 中有客户端连接的所有房间 ID 列表。
+// 这个方法是并发安全的。
+func (h *Hub) GetActiveRoomIDs() []uint {
+	h.roomsMu.RLock() // 加读锁
+	defer h.roomsMu.RUnlock() // 保证锁释放
+
+	ids := make([]uint, 0, len(h.rooms)) // 预分配容量
+	for id := range h.rooms {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // *** 添加 MessageChan 方法 ***
@@ -1366,8 +1606,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
 	//"strings" // 用于 isDuplicateEntryError
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 
 	// 使用正确的 Domain 模型路径 (internal/domain) 和 Repository 接口路径
@@ -1419,14 +1661,15 @@ func (r *GormRoomRepository) Save(ctx context.Context, roomData *domain.Room) er
 	result := r.db.WithContext(ctx).Save(roomData)
 	err := result.Error
 	if err != nil {
-		// 检查 invite_code 唯一约束错误
-		// TODO: 替换为更健壮的唯一约束错误检查
-		if isDuplicateEntryError(err) { // 使用与 user_repository 相同的辅助函数
-			return repository.ErrDuplicateEntry
-		}
-		return fmt.Errorf("gorm: save room (id: %d, invite_code: %s): %w", roomData.ID, roomData.InviteCode, err)
-	}
-	return nil
+        // --- 健壮的唯一约束检查 (以 MySQL 为例) ---
+        var mysqlErr *mysql.MySQLError
+        if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+            return repository.ErrDuplicateEntry // 映射为定义的仓库错误
+        }
+        // --- 检查结束 ---
+        return fmt.Errorf("gorm: save room (id: %d, invite_code: %s): %w", roomData.ID, roomData.InviteCode, err)
+    }
+    return nil
 }
 
 // FindAllActive 实现根据 ID 列表批量获取房间信息
@@ -1457,8 +1700,6 @@ func (r *GormRoomRepository) IsInviteCodeExists(ctx context.Context, code string
 	return count > 0, nil
 }
 
-// isDuplicateEntryError (如果 user_repository.go 中未定义，则在此定义或移至共享位置)
-// func isDuplicateEntryError(err error) bool { ... } // 同上
 
 --- 文件: internal/infra/persistence/gorm/user_repository.go ---
 
@@ -1468,8 +1709,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings" // 用于检查错误字符串 (临时方案)
 
+	//"strings" // 用于检查错误字符串 (临时方案)
+
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	// "gorm.io/gorm/clause" // Save 方法暂时不需要这个
 
@@ -1535,36 +1778,20 @@ func (r *GormUserRepository) Save(ctx context.Context, user *domain.User) error 
 	err := result.Error
 
 	if err != nil {
-		// 尝试检查是否是唯一约束错误
-		// TODO: 替换为更健壮的唯一约束错误检查方式
-		if isDuplicateEntryError(err) {
-			return repository.ErrDuplicateEntry // 映射为定义的仓库错误
-		}
-		// 返回包装后的其他错误
-		return fmt.Errorf("gorm: save user (id: %d, username: %s): %w", user.ID, user.Username, err)
-	}
+        // --- 健壮的唯一约束检查 ---
+        var mysqlErr *mysql.MySQLError
+        if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 { // 1062 是 MySQL 的 Duplicate entry 错误号
+            return repository.ErrDuplicateEntry // 返回定义的仓库错误
+        }
+        // --- 检查结束 ---
 
-	// 可选：检查是否有行受到影响
-	// if result.RowsAffected == 0 && user.ID != 0 {
-	//     // 如果是更新操作但没有行受影响，可能表示记录不存在？
-	//     // 但 Save 通常不用于这种情况，Find + Update 更合适
-	// }
-
-	return nil
+        // 其他数据库错误
+        return fmt.Errorf("gorm: save user (id: %d, username: %s): %w", user.ID, user.Username, err)
+    }
+    return nil
 }
 
-// isDuplicateEntryError 是一个临时的辅助函数，用于检查常见的唯一约束错误字符串。
-// 强烈建议替换为特定数据库驱动的错误检查。
-func isDuplicateEntryError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	// 常见的错误信息片段
-	return strings.Contains(msg, "UNIQUE constraint failed") || // SQLite
-		strings.Contains(msg, "Duplicate entry") || // MySQL
-		strings.Contains(msg, "duplicate key value violates unique constraint") // PostgreSQL
-}
+
 
 --- 文件: internal/infra/persistence/gorm/snap_repository.go ---
 
@@ -1974,6 +2201,10 @@ func (r *RedisStateRepository) roomPubSubChannel(roomID uint) string {
 	return fmt.Sprintf("%sroom:%d:pubsub", r.keyPrefix, roomID)
 }
 
+func (r *RedisStateRepository) roomLastSnapshotTimeKey(roomID uint) string {
+	return fmt.Sprintf("%sroom:%d:last_snapshot_time", r.keyPrefix, roomID) // String key
+}
+
 // --- StateRepository Interface Implementation ---
 
 // GetBoardState 获取指定房间的当前完整白板状态 (来自 Redis Hash)
@@ -2179,6 +2410,73 @@ func (r *RedisStateRepository) PublishAction(ctx context.Context, roomID uint, a
 		return fmt.Errorf("redis: failed to publish action to channel %s: %w", channel, err)
 	}
 	return nil
+}
+
+// ---  实现 Snapshot Worker State 方法 ---
+
+// GetLastSnapshotTime 获取指定房间上次快照的时间戳 (来自 Redis)
+func (r *RedisStateRepository) GetLastSnapshotTime(ctx context.Context, roomID uint) (time.Time, error) {
+	key := r.roomLastSnapshotTimeKey(roomID)
+	// 时间戳通常存储为 Unix 时间戳 (秒或纳秒) 的字符串形式
+	timestampStr, err := r.client.Get(ctx, key).Result()
+
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			// Key 不存在，表示从未记录过，返回 time.Time 的零值
+			return time.Time{}, nil
+		}
+		// 其他 Redis 错误
+		return time.Time{}, fmt.Errorf("redis: failed to get last snapshot time for room %d from %s: %w", roomID, key, err)
+	}
+
+	// 将字符串解析为 int64 (假设存储的是 Unix 秒)
+	timestampSec, parseErr := strconv.ParseInt(timestampStr, 10, 64)
+	if parseErr != nil {
+		// Redis 中存储的值格式不正确
+		logrus.Warnf("redis: failed to parse last snapshot time '%s' for room %d from %s: %v", timestampStr, roomID, key, parseErr)
+		// 可以选择返回零值或错误
+		return time.Time{}, nil // 容错处理，下次会重新生成
+	}
+
+	// 将 Unix 秒转换为 time.Time
+	return time.Unix(timestampSec, 0), nil
+}
+
+// SetLastSnapshotTime 设置指定房间上次快照的时间戳 (存储到 Redis)
+func (r *RedisStateRepository) SetLastSnapshotTime(ctx context.Context, roomID uint, timestamp time.Time, ttl time.Duration) error {
+	key := r.roomLastSnapshotTimeKey(roomID)
+	// 将 time.Time 转换为 Unix 时间戳 (秒) 的字符串
+	timestampStr := strconv.FormatInt(timestamp.Unix(), 10)
+
+	// 使用 Set 命令写入，并设置过期时间 TTL
+	// 如果 ttl 为 0，表示不过期
+	err := r.client.Set(ctx, key, timestampStr, ttl).Err()
+	if err != nil {
+		return fmt.Errorf("redis: failed to set last snapshot time for room %d on key %s: %w", roomID, key, err)
+	}
+	return nil
+}
+
+func (r *RedisStateRepository) CleanupRoomState(ctx context.Context, roomID uint) error {
+    keysToDelete := []string{
+        r.roomStateKey(roomID),
+        r.roomVersionKey(roomID),
+        r.roomOpCountKey(roomID),
+        r.roomActionHistoryKey(roomID),
+        r.roomSnapshotCacheKey(roomID),
+        r.roomLastSnapshotTimeKey(roomID), // 也清理上次快照时间
+    }
+
+    // 使用 Del 命令批量删除 key
+    // Del 返回成功删除的 key 的数量，如果 key 不存在也不会报错
+    deletedCount, err := r.client.Del(ctx, keysToDelete...).Result()
+    if err != nil {
+        // 记录错误，但可能不是致命的
+        logrus.WithError(err).Warnf("Redis: Failed to delete some keys during room cleanup for room %d", roomID)
+        return fmt.Errorf("redis: failed to cleanup room state for room %d: %w", roomID, err)
+    }
+    logrus.Infof("Redis: Cleaned up %d keys for room %d", deletedCount, roomID)
+    return nil
 }
 
 --- 文件: internal/middleware/auth.go ---
@@ -2506,6 +2804,9 @@ type StateRepository interface {
 	// ResetOpCount 重置房间的操作计数器（通常在生成快照后调用）。
 	ResetOpCount(ctx context.Context, roomID uint) error
 
+	// 清理房间相关的 Redis key
+	CleanupRoomState(ctx context.Context, roomID uint) error 
+	
 	// === Action History for OT ===
 
 	// GetRecentActions 获取存储在 Redis 中的最近操作记录（用于 OT）。
@@ -2532,6 +2833,16 @@ type StateRepository interface {
 	// === PubSub ===
 	// PublishAction 将处理后的 Action 发布到指定房间的频道。
 	PublishAction(ctx context.Context, roomID uint, action domain.Action) error
+
+	// === Snapshot Worker State ===
+
+	// GetLastSnapshotTime 获取指定房间上次快照的时间戳 (来自 Redis)
+	// 如果没有记录，可以返回 time.Time{} 的零值和 nil 错误
+	GetLastSnapshotTime(ctx context.Context, roomID uint) (time.Time, error)
+
+	// SetLastSnapshotTime 设置指定房间上次快照的时间戳 (存储到 Redis)
+	// 可以考虑设置一个合理的过期时间，例如几天，防止无用 key 堆积
+	SetLastSnapshotTime(ctx context.Context, roomID uint, timestamp time.Time, ttl time.Duration) error
 }
 
 --- 文件: internal/repository/snapshot.go ---
@@ -2617,6 +2928,295 @@ var (
 	// ErrInviteCodeTaken = ErrDuplicateEntry
 )
 
+--- 文件: internal/repository/mocks/user_repository_mock.go ---
+
+package mocks // 通常将 mock 对象放在专门的 mocks 子包中
+
+import (
+	"context"
+	// 导入 domain 和 repository 包
+	"collaborative-blackboard/internal/domain"
+	"collaborative-blackboard/internal/repository"
+
+	"github.com/stretchr/testify/mock" // 导入 testify mock
+)
+
+// UserRepository is an autogenerated mock type for the UserRepository type
+// 通常 mock 文件名会加上 _mock 后缀
+type UserRepository struct {
+	mock.Mock // 嵌入 mock.Mock
+}
+
+// FindByUsername 提供了一个模拟函数，带有字段：ctx, username
+func (_m *UserRepository) FindByUsername(ctx context.Context, username string) (*domain.User, error) {
+	// 调用 mock.Called 来记录方法被调用，并返回预设的结果
+	ret := _m.Called(ctx, username)
+
+	// 处理返回值的类型断言
+	var r0 *domain.User
+	if rf, ok := ret.Get(0).(func(context.Context, string) *domain.User); ok {
+		r0 = rf(ctx, username)
+	} else {
+		// 如果返回值不是 nil，尝试进行类型断言
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*domain.User)
+		}
+	}
+
+	var r1 error
+	if rf, ok := ret.Get(1).(func(context.Context, string) error); ok {
+		r1 = rf(ctx, username)
+	} else {
+		r1 = ret.Error(1) // 获取预设的错误
+	}
+
+	return r0, r1
+}
+
+// FindByID 提供了一个模拟函数，带有字段：ctx, id
+func (_m *UserRepository) FindByID(ctx context.Context, id uint) (*domain.User, error) {
+	ret := _m.Called(ctx, id)
+
+	var r0 *domain.User
+	if rf, ok := ret.Get(0).(func(context.Context, uint) *domain.User); ok {
+		r0 = rf(ctx, id)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*domain.User)
+		}
+	}
+
+	var r1 error
+	if rf, ok := ret.Get(1).(func(context.Context, uint) error); ok {
+		r1 = rf(ctx, id)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// Save 提供了一个模拟函数，带有字段：ctx, user
+func (_m *UserRepository) Save(ctx context.Context, user *domain.User) error {
+	ret := _m.Called(ctx, user)
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, *domain.User) error); ok {
+		r0 = rf(ctx, user)
+	} else {
+		r0 = ret.Error(0) // Save 只返回一个 error
+	}
+
+	return r0
+}
+
+// --- 断言 Mock 实现了接口 ---
+// 这是一个编译时检查，确保我们的 Mock 类型确实实现了 UserRepository 接口
+var _ repository.UserRepository = (*UserRepository)(nil)
+
+--- 文件: internal/service/auth_test.go ---
+
+package service_test // 测试包
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	// 导入必要的包
+	"collaborative-blackboard/internal/domain"
+	"collaborative-blackboard/internal/repository"
+	"collaborative-blackboard/internal/repository/mocks" // 导入 Mock 实现
+	"collaborative-blackboard/internal/service"         // 导入被测试的包
+	"github.com/stretchr/testify/assert"                // 导入断言库
+	"github.com/stretchr/testify/mock"                  // 导入 Mock 库
+	"github.com/stretchr/testify/require"               // 导入 Require 断言库
+	"golang.org/x/crypto/bcrypt"                        // 需要 bcrypt 用于密码哈希比较 (如果需要)
+)
+
+// --- 测试 Register 方法 ---
+
+func TestAuthService_Register_Success(t *testing.T) {
+	// Arrange: 准备 Mock 对象, Service 实例, 和测试数据
+	mockUserRepo := new(mocks.UserRepository) // 创建 Mock UserRepository
+	jwtSecret := "very-secret-key"
+	jwtExpiry := 1 // 1 小时过期 (用于 NewAuthService)
+	authService, err := service.NewAuthService(mockUserRepo, jwtSecret, jwtExpiry)
+	require.NoError(t, err, "创建 AuthService 不应失败") // 使用 require 确保前置条件满足
+
+	ctx := context.Background()
+	username := "newbie"
+	password := "StrongPass123"
+	email := "newbie@example.com"
+
+	// 设置 Mock 预期:
+	// 1. 当 FindByUsername 被调用时，模拟用户不存在
+	mockUserRepo.On("FindByUsername", ctx, username).
+		Return(nil, repository.ErrUserNotFound). // 返回预设的 "未找到" 错误
+		Once() // 预期调用一次
+
+	// 2. 当 Save 被调用时，模拟保存成功，并填充 ID/时间戳
+	mockUserRepo.On("Save", ctx, mock.MatchedBy(func(user *domain.User) bool {
+		// 可以在这里添加对传入 user 对象的断言检查
+		assert.Equal(t, username, user.Username)
+		assert.Equal(t, email, user.Email)
+		// 验证密码是否已哈希 (简单检查长度或使用 bcrypt.Compare)
+		assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)), "密码应被正确哈希")
+		return true // 返回 true 表示参数匹配预期
+	})).
+		Run(func(args mock.Arguments) { // 模拟数据库填充字段
+			userArg := args.Get(1).(*domain.User)
+			userArg.ID = 5 // 假设分配的 ID 是 5
+			userArg.CreatedAt = time.Now().Add(-time.Second) // 模拟创建时间
+			userArg.UpdatedAt = time.Now().Add(-time.Second) // 模拟更新时间
+		}).
+		Return(nil). // 返回 nil 表示 Save 成功
+		Once()       // 预期调用一次
+
+	// Act: 执行被测试的 Register 方法
+	registeredUser, err := authService.Register(ctx, username, password, email)
+
+	// Assert: 验证 Register 的结果
+	assert.NoError(t, err, "成功注册时不应有错误")
+	assert.NotNil(t, registeredUser, "成功注册时应返回用户对象")
+	if registeredUser != nil { // 添加检查避免 nil panic
+		assert.Equal(t, uint(5), registeredUser.ID, "返回的用户 ID 应为 5")
+		assert.Equal(t, username, registeredUser.Username)
+		assert.Equal(t, email, registeredUser.Email)
+		assert.Empty(t, registeredUser.Password, "返回的用户密码应为空") // Service 应清除密码
+		assert.False(t, registeredUser.CreatedAt.IsZero(), "创建时间应被设置")
+		assert.False(t, registeredUser.UpdatedAt.IsZero(), "更新时间应被设置")
+	}
+
+	// Verify: 确保 Mock 的所有预期都被满足
+	mockUserRepo.AssertExpectations(t)
+}
+
+func TestAuthService_Register_UsernameTaken(t *testing.T) {
+	// Arrange
+	mockUserRepo := new(mocks.UserRepository)
+	authService, _ := service.NewAuthService(mockUserRepo, "secret", 1)
+	ctx := context.Background()
+	username := "existingUser"
+
+	// 设置 Mock 预期: FindByUsername 找到一个已存在的用户
+	existingUser := &domain.User{ID: 10, Username: username}
+	mockUserRepo.On("FindByUsername", ctx, username).Return(existingUser, nil).Once()
+	// 预期 Save 不会被调用
+
+	// Act
+	_, err := authService.Register(ctx, username, "password", "email@test.com")
+
+	// Assert
+	require.Error(t, err, "用户名已存在时应返回错误") // 使用 require 强调错误必须发生
+	assert.True(t, errors.Is(err, service.ErrRegistrationFailed), "错误类型应为 ErrRegistrationFailed")
+
+	// Verify
+	mockUserRepo.AssertExpectations(t)
+	// 明确断言 Save 没有被调用 (更严格的验证)
+	mockUserRepo.AssertNotCalled(t, "Save", mock.Anything, mock.Anything)
+}
+
+func TestAuthService_Register_SaveFails_DuplicateEntry(t *testing.T) {
+	// Arrange
+	mockUserRepo := new(mocks.UserRepository)
+	authService, _ := service.NewAuthService(mockUserRepo, "secret", 1)
+	ctx := context.Background()
+	username := "anotherNewUser"
+
+	// 设置 Mock 预期:
+	// 1. FindByUsername 找不到用户
+	mockUserRepo.On("FindByUsername", ctx, username).Return(nil, repository.ErrUserNotFound).Once()
+	// 2. Save 调用时模拟数据库返回唯一约束错误
+	mockUserRepo.On("Save", ctx, mock.AnythingOfType("*domain.User")).Return(repository.ErrDuplicateEntry).Once()
+
+	// Act
+	_, err := authService.Register(ctx, username, "password", "email2@test.com")
+
+	// Assert
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, service.ErrRegistrationFailed), "保存冲突时应返回 ErrRegistrationFailed")
+
+	// Verify
+	mockUserRepo.AssertExpectations(t)
+}
+
+// --- 测试 Login 方法 ---
+
+func TestAuthService_Login_Success(t *testing.T) {
+	// Arrange
+	mockUserRepo := new(mocks.UserRepository)
+	authService, _ := service.NewAuthService(mockUserRepo, "test-secret", 24)
+	ctx := context.Background()
+	username := "testuser"
+	password := "password123"
+	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	userInDb := &domain.User{ID: 1, Username: username, Password: string(hashedPassword)}
+
+	// 设置 Mock 预期: FindByUsername 成功找到用户
+	mockUserRepo.On("FindByUsername", ctx, username).Return(userInDb, nil).Once()
+
+	// Act
+	token, err := authService.Login(ctx, username, password)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.NotEmpty(t, token)
+	// 可以进一步验证 Token 内容 (可选)
+
+	// Verify
+	mockUserRepo.AssertExpectations(t)
+}
+
+func TestAuthService_Login_UserNotFound(t *testing.T) {
+	// Arrange
+	mockUserRepo := new(mocks.UserRepository)
+	authService, _ := service.NewAuthService(mockUserRepo, "test-secret", 24)
+	ctx := context.Background()
+	username := "nonexistent"
+
+	// 设置 Mock 预期: FindByUsername 找不到用户
+	mockUserRepo.On("FindByUsername", ctx, username).Return(nil, repository.ErrUserNotFound).Once()
+
+	// Act
+	token, err := authService.Login(ctx, username, "password")
+
+	// Assert
+	require.Error(t, err)
+	assert.Empty(t, token)
+	assert.True(t, errors.Is(err, service.ErrAuthenticationFailed))
+
+	// Verify
+	mockUserRepo.AssertExpectations(t)
+}
+
+func TestAuthService_Login_IncorrectPassword(t *testing.T) {
+	// Arrange
+	mockUserRepo := new(mocks.UserRepository)
+	authService, _ := service.NewAuthService(mockUserRepo, "test-secret", 24)
+	ctx := context.Background()
+	username := "testuser"
+	correctPassword := "password123"
+	incorrectPassword := "wrongpassword"
+	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(correctPassword), bcrypt.DefaultCost)
+	userInDb := &domain.User{ID: 1, Username: username, Password: string(hashedPassword)}
+
+	// 设置 Mock 预期: FindByUsername 找到用户
+	mockUserRepo.On("FindByUsername", ctx, username).Return(userInDb, nil).Once()
+
+	// Act
+	token, err := authService.Login(ctx, username, incorrectPassword)
+
+	// Assert
+	require.Error(t, err)
+	assert.Empty(t, token)
+	assert.True(t, errors.Is(err, service.ErrAuthenticationFailed))
+
+	// Verify
+	mockUserRepo.AssertExpectations(t)
+}
+
 --- 文件: internal/service/auth.go ---
 
 package service
@@ -2625,7 +3225,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	// 使用正确的模块路径
@@ -2691,14 +3290,11 @@ func (s *AuthService) Register(ctx context.Context, username, password, email st
 	// 4. 保存用户 (调用 Repository 接口)
 	err = s.userRepo.Save(ctx, user)
 	if err != nil {
-		// 优先检查是否是仓库层返回的特定错误
-		if errors.Is(err, repository.ErrDuplicateEntry) {
-			logCtx.WithError(err).Warn("Registration failed: Username or email already exists (repo error)")
-			return nil, ErrRegistrationFailed // 返回业务错误
-		} else if isDuplicateEntryErrorString(err) { // 临时的字符串检查作为后备
-			logCtx.WithError(err).Warn("Registration failed: Username or email already exists (string check)")
-			return nil, ErrRegistrationFailed
-		}
+		// --- 只检查来自 Repository 的特定错误 ---
+        if errors.Is(err, repository.ErrDuplicateEntry) {
+            logCtx.WithError(err).Warn("Registration failed: Username or email already exists (repo error)")
+            return nil, ErrRegistrationFailed // 返回业务错误
+        }
 		// 其他数据库错误
 		logCtx.WithError(err).Error("Database error during user creation")
 		return nil, ErrInternalServer
@@ -2781,17 +3377,6 @@ func (s *AuthService) generateJWT(userID uint) (string, error) {
 	return tokenString, nil
 }
 
-// isDuplicateEntryErrorString (临时的字符串检查)
-// TODO: 当 GormUserRepository 返回 repository.ErrDuplicateEntry 后移除此函数
-func isDuplicateEntryErrorString(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") ||
-		strings.Contains(msg, "Duplicate entry") ||
-		strings.Contains(msg, "duplicate key value violates unique constraint")
-}
 
 --- 文件: internal/service/collaboration.go ---
 
@@ -3238,15 +3823,11 @@ func (s *RoomService) CreateRoom(ctx context.Context, creatorID uint) (*domain.R
 	// 3. 保存房间 (调用 Repository 接口)
 	err = s.roomRepo.Save(ctx, room)
 	if err != nil {
-		// 依赖 Repository 返回明确的错误类型
-		if errors.Is(err, repository.ErrDuplicateEntry) {
-			logCtx.WithError(err).Error("Failed to save new room due to duplicate entry (invite code conflict?)")
-			// 理论上不应发生，返回内部错误
-			return nil, ErrInternalServer
-		} else if isDuplicateEntryErrorString(err) { // 临时后备检查
-			logCtx.WithError(err).Error("Failed to save new room due to duplicate entry (invite code conflict?)")
-			return nil, ErrInternalServer
-		}
+		// --- 只检查来自 Repository 的特定错误 ---
+        if errors.Is(err, repository.ErrDuplicateEntry) {
+            logCtx.WithError(err).Error("Failed to save new room due to duplicate entry (invite code conflict?)")
+            return nil, ErrInternalServer // 理论上不应发生，视为内部错误
+        }
 		// 其他数据库错误
 		logCtx.WithError(err).Error("Failed to save new room to database")
 		return nil, ErrInternalServer
@@ -3350,7 +3931,6 @@ func (s *RoomService) generateUniqueInviteCode(ctx context.Context) (string, err
 	return "", fmt.Errorf("failed to generate a unique invite code after %d attempts", maxAttempts)
 }
 
-// isDuplicateEntryErrorString (如果需要，从 auth.go 复制或移到共享位置)
 // func isDuplicateEntryErrorString(err error) bool { ... }
 
 --- 文件: internal/service/errors.go ---
@@ -3405,8 +3985,7 @@ import (
 // 定义任务类型常量
 const (
 	TypeActionPersistence = "action:persist" // Action 持久化任务类型
-	// 可以定义其他任务类型，例如:
-	// TypeSnapshotGeneration = "snapshot:generate"
+	 TypeSnapshotGeneration = "snapshot:generate"
 	// TypeClientCleanup      = "client:cleanup"
 )
 
@@ -3432,6 +4011,12 @@ func NewActionPersistenceTask(action domain.Action) ([]byte, error) {
 	// 注意：Asynq 的 NewTask 现在推荐直接传递 []byte payload
 	// task := asynq.NewTask(TypeActionPersistence, payloadBytes)
 	return payloadBytes, nil // 返回序列化后的 payload
+}
+
+const TypeSnapshotPeriodicCheck = "snapshot:periodic_check"
+
+func NewSnapshotPeriodicCheckTask() ([]byte, error) {
+	return []byte(""), nil // Payload 可以是空字符串或 nil
 }
 
 --- 文件: internal/worker/handler.go ---
@@ -3511,6 +4096,8 @@ import (
 	"context"
 	"errors"
 	"net/http" // 需要导入 http 以检查 ErrServerClosed
+	//"sync"
+	//"time"
 
 	"github.com/hibiken/asynq"
 	"github.com/sirupsen/logrus"
@@ -3518,6 +4105,8 @@ import (
 	// 导入内部包
 	"collaborative-blackboard/internal/repository"
 	"collaborative-blackboard/internal/tasks"
+	"collaborative-blackboard/internal/hub"      
+	"collaborative-blackboard/internal/service"  
 )
 
 // WorkerServer 封装了 Asynq Worker Server 的启动和关闭逻辑
@@ -3525,10 +4114,13 @@ type WorkerServer struct {
 	server *asynq.Server
 	log    *logrus.Entry
 	actionRepo repository.ActionRepository // 将 actionRepo 存储在结构体中
+	hub             *hub.Hub             //  Hub 依赖
+	snapshotService *service.SnapshotService //  SnapshotService 依赖
+	stateRepo       repository.StateRepository
 }
 
 // NewWorkerServer 创建一个新的 WorkerServer 实例
-func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.ActionRepository, logger *logrus.Logger) *WorkerServer {
+func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.ActionRepository, hub *hub.Hub,snapshotService *service.SnapshotService,stateRepo repository.StateRepository,logger *logrus.Logger,) *WorkerServer {
 	logEntry := logger.WithField("component", "worker_server")
 
 	server := asynq.NewServer(
@@ -3561,10 +4153,16 @@ func NewWorkerServer(redisOpt asynq.RedisClientOpt, actionRepo repository.Action
 		},
 	)
 
+	if hub == nil { panic("Hub cannot be nil for WorkerServer") }
+    if snapshotService == nil { panic("SnapshotService cannot be nil for WorkerServer") }
+	if stateRepo == nil { panic("StateRepository cannot be nil for WorkerServer") }
 	return &WorkerServer{
 		server: server,
 		log:    logEntry,
 		actionRepo: actionRepo, // 存储 actionRepo
+		hub:             hub,             
+		snapshotService: snapshotService, 
+		stateRepo:       stateRepo,
 	}
 }
 
@@ -3576,6 +4174,10 @@ func (ws *WorkerServer) Start() {
 	// 注册任务处理器
 	actionPersistenceHandler := NewActionPersistenceHandler(ws.actionRepo)
 	mux.HandleFunc(tasks.TypeActionPersistence, actionPersistenceHandler.ProcessTask)
+
+	snapshotCheckHandler := NewSnapshotCheckHandler(ws.hub, ws.snapshotService, ws.stateRepo) // 注入依赖
+	mux.HandleFunc(tasks.TypeSnapshotPeriodicCheck, snapshotCheckHandler.ProcessTask)
+	// --- 注册结束 ---
 
 	// TODO: 注册其他任务处理器
 
@@ -3597,6 +4199,132 @@ func (ws *WorkerServer) Shutdown() {
 	ws.log.Info("Worker server shut down complete.")
 }
 
+--- 文件: internal/worker/snapshot_handler.go ---
+
+package worker
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	// "encoding/json" // 不需要解析 payload
+	"time" // 需要 time
+
+	"github.com/hibiken/asynq"
+	"github.com/sirupsen/logrus"
+
+	// 导入依赖
+	"collaborative-blackboard/internal/hub"     // 需要 Hub 获取活跃房间
+	"collaborative-blackboard/internal/service" // 需要 SnapshotService
+	// "collaborative-blackboard/internal/tasks" // 暂时不需要 tasks 包的 payload
+	"collaborative-blackboard/internal/repository"
+)
+
+// SnapshotCheckHandler 处理周期性的快照检查任务
+type SnapshotCheckHandler struct {
+	hub             *hub.Hub             // 用于获取活跃房间 ID
+	snapshotService *service.SnapshotService // 用于检查和生成快照
+	stateRepo       repository.StateRepository // <--- 新增 StateRepository 依赖
+}
+
+// NewSnapshotCheckHandler 创建 Handler 实例
+func NewSnapshotCheckHandler(hub *hub.Hub, snapshotService *service.SnapshotService,stateRepo repository.StateRepository,) *SnapshotCheckHandler {
+	// 添加 nil 检查
+    if hub == nil { panic("Hub cannot be nil for SnapshotCheckHandler") }
+    if snapshotService == nil { panic("SnapshotService cannot be nil for SnapshotCheckHandler") }
+	if stateRepo == nil { panic("StateRepository cannot be nil for SnapshotCheckHandler") }
+	return &SnapshotCheckHandler{
+		hub:             hub,
+		snapshotService: snapshotService,
+		stateRepo:       stateRepo,
+	}
+}
+
+// ProcessTask 实现 asynq.Handler 接口
+func (h *SnapshotCheckHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
+    taskID := t.ResultWriter().TaskID()
+	logCtx := logrus.WithFields(logrus.Fields{
+		"task_id":   taskID,
+		"task_type": t.Type(),
+		"queue":     "default", // 假设在 default 队列
+	})
+	logCtx.Info("Processing periodic snapshot check task...")
+
+	// 1. 获取当前活跃的房间 ID 列表
+    // Hub 需要提供一个获取活跃房间 ID 的方法
+	activeRoomIDs := h.hub.GetActiveRoomIDs() // 假设 Hub 有此方法
+	if len(activeRoomIDs) == 0 {
+		logCtx.Info("No active rooms found, skipping snapshot check.")
+		return nil // 没有活跃房间，任务成功完成
+	}
+	logCtx.Infof("Found %d active rooms to check.", len(activeRoomIDs))
+
+	// 2. 遍历活跃房间，检查并生成快照
+	var wg sync.WaitGroup // 用于等待所有房间检查完成 (可选)
+    errors := make([]error, 0) // 收集错误
+    errMu := sync.Mutex{} // 保护 errors slice
+
+	for _, roomID := range activeRoomIDs {
+		wg.Add(1)
+		go func(rID uint) { // 为每个房间启动一个 goroutine 进行检查
+			defer wg.Done()
+			roomLogCtx := logCtx.WithField("room_id", rID)
+
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // 为每个房间检查设置超时
+            defer cancel()
+
+			// --- 从 Redis 获取上次快照时间 ---
+			lastTime, err := h.stateRepo.GetLastSnapshotTime(checkCtx, rID)
+            if err != nil {
+                // 获取失败，记录错误但可能继续尝试生成（当作首次）
+                roomLogCtx.WithError(err).Error("Failed to get last snapshot time from repository")
+                lastTime = time.Time{} // 使用零值时间
+            }
+            // --- 获取结束 ---
+
+			// b. 调用 Service 检查并生成快照 
+			newLastTime, err := h.snapshotService.CheckAndGenerateSnapshot(checkCtx, rID, lastTime)
+
+			if err != nil {
+                roomLogCtx.WithError(err).Error("Snapshot check/generation failed for room")
+                // 记录错误，但不让整个周期任务失败
+                errMu.Lock()
+                errors = append(errors, fmt.Errorf("room %d: %w", rID, err))
+                errMu.Unlock()
+			} else if !newLastTime.Equal(lastTime) { // 如果时间戳更新了，说明生成了快照
+                roomLogCtx.Info("Snapshot generated or check successful, updating last snapshot time.")
+				// ---  将新时间戳存回 Redis ---
+                // 设置一个合理的 TTL，例如 7 天
+                ttl := 7 * 24 * time.Hour
+				if err := h.stateRepo.SetLastSnapshotTime(checkCtx, rID, newLastTime, ttl); err != nil {
+                    // 设置失败，只记录警告
+                    roomLogCtx.WithError(err).Warn("Failed to set last snapshot time in repository")
+                }
+                // --- 设置结束 ---
+			} else {
+                 roomLogCtx.Debug("Snapshot check complete, no generation needed.")
+            }
+		}(roomID)
+	}
+
+	wg.Wait() // 等待所有房间检查完成
+
+    // 检查是否有错误发生
+    if len(errors) > 0 {
+         // 返回一个聚合错误，Asynq 可能会重试整个周期任务
+         // 或者只记录错误，返回 nil 表示周期检查完成（即使部分房间失败）
+         // 我们选择后者，避免因单个房间问题导致所有房间重试
+         logCtx.Errorf("Snapshot check completed with %d errors for some rooms.", len(errors))
+         // for _, e := range errors { logCtx.Error(e) } // 可以记录详细错误
+         return nil // 认为周期任务本身是完成的
+    }
+
+
+	logCtx.Info("Periodic snapshot check task completed successfully.")
+	return nil // 任务成功
+}
+
 --- 文件: internal/bootstrap/app.go ---
 
 package bootstrap
@@ -3608,6 +4336,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -3625,8 +4354,10 @@ import (
 	"collaborative-blackboard/internal/infra/setup"
 	redisstate "collaborative-blackboard/internal/infra/state/redis"
 	"collaborative-blackboard/internal/middleware"
-	//"collaborative-blackboard/internal/repository" 
+
+	//"collaborative-blackboard/internal/repository"
 	"collaborative-blackboard/internal/service"
+	"collaborative-blackboard/internal/tasks"
 	"collaborative-blackboard/internal/worker"
 )
 
@@ -3648,6 +4379,7 @@ type Config struct {
 	JWTExpiryHours  int
 	AppEnv          string // 新增: 应用环境 (development/production)
 	KeyPrefix       string // 新增: Redis Key 前缀
+	WebSocketAllowedOrigins []string // 允许的 WebSocket 源列表
 }
 
 // LoadConfig 从环境变量加载配置
@@ -3674,6 +4406,20 @@ func LoadConfig() (*Config, error) {
 		JWTExpiryHours:  24,
 	}
 
+	// 加载 WebSocket 允许的源 (逗号分隔)
+    originsStr := os.Getenv("WEBSOCKET_ALLOWED_ORIGINS") // 例如 "http://localhost:3000,https://yourdomain.com"
+    if originsStr != "" {
+        cfg.WebSocketAllowedOrigins = strings.Split(originsStr, ",")
+        // 可以添加 TrimSpace 等处理
+        for i := range cfg.WebSocketAllowedOrigins {
+            cfg.WebSocketAllowedOrigins[i] = strings.TrimSpace(cfg.WebSocketAllowedOrigins[i])
+        }
+    } else {
+        // 如果没有配置，可以设置一个默认值（例如只允许本地开发）或不允许任何连接？
+         cfg.WebSocketAllowedOrigins = []string{"http://localhost:3000"} // 默认仅允许本地开发
+         logrus.Warn("WEBSOCKET_ALLOWED_ORIGINS not set, defaulting to localhost:3000")
+    }
+	
 	// 处理 Redis DB
 	redisDBStr := os.Getenv("REDIS_DB")
 	cfg.RedisDB, _ = strconv.Atoi(redisDBStr) // 忽略错误，默认为 0
@@ -3706,6 +4452,7 @@ type App struct {
 	AsynqServer  *worker.WorkerServer
 	Hub          *hub.Hub
 	HttpServer   *http.Server
+	redisClientOpt asynq.RedisClientOpt
 	// 可以存储其他组件以便 Shutdown 时访问，或者仅在 NewApp 中使用
 	// actionRepo   repository.ActionRepository
 }
@@ -3777,19 +4524,19 @@ func NewApp() (*App, error) {
 
 	// 6. 初始化 Hub (注入 Redis Client 和 Prefix)
 	log.Info("Initializing hub...")
-	hubInstance := hub.NewHub(collabService, snapshotService, asynqClient, redisClient, cfg.KeyPrefix)
+	hubInstance := hub.NewHub(collabService, snapshotService, asynqClient, redisClient, cfg.KeyPrefix, stateRepo)
 	log.Info("Hub initialized")
 
 	// 7. 初始化 Handlers
 	log.Info("Initializing handlers...")
 	authHandler := httpHandler.NewAuthHandler(authService)
 	roomHandler := httpHandler.NewRoomHandler(roomService)
-	wsHandler := wsHandler.NewWebSocketHandler(hubInstance, roomService)
+	wsHandler := wsHandler.NewWebSocketHandler(hubInstance, roomService, cfg.WebSocketAllowedOrigins)
 	log.Info("Handlers initialized")
 
 	// 8. 初始化 Worker Server
 	log.Info("Initializing worker server...")
-	workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, log)
+	workerServer := worker.NewWorkerServer(redisClientOpt, actionRepo, hubInstance, snapshotService, stateRepo, log)
 	log.Info("Worker server initialized")
 
 	// 9. 初始化 Gin Engine 和路由
@@ -3875,6 +4622,8 @@ func (a *App) Start() {
 	go a.AsynqServer.Start() // Start 不再需要参数
 	a.Log.Info("Asynq worker server routine started")
 
+	a.registerPeriodicTasks()
+
 	// 启动 HTTP 服务器
 	go func() {
 		a.Log.Infof("HTTP server starting to listen on %s", a.HttpServer.Addr)
@@ -3884,6 +4633,45 @@ func (a *App) Start() {
 		}
 		a.Log.Info("HTTP server stopped listening.")
 	}()
+}
+
+
+func (a *App) registerPeriodicTasks() {
+    scheduler := asynq.NewScheduler(a.redisClientOpt, &asynq.SchedulerOpts{
+        // Location: time.UTC, // 可以设置时区
+    })
+
+    // 创建周期性快照检查任务
+    taskPayload, err := tasks.NewSnapshotPeriodicCheckTask()
+    if err != nil {
+        a.Log.Errorf("Failed to create snapshot periodic check task payload: %v", err)
+        return // 或者 panic?
+    }
+    task := asynq.NewTask(tasks.TypeSnapshotPeriodicCheck, taskPayload)
+
+    schedule := "@every 5m"
+    // --- 使用 _ 忽略 entryID，或者在日志中使用它 ---
+    entryID, err := scheduler.Register(schedule, task, asynq.Queue("default")) // <--- 使用 _ 或者 entryID
+    if err != nil {
+        a.Log.Errorf("Could not register periodic snapshot check task: %v", err)
+    } else {
+        // --- 在日志中使用 entryID ---
+        a.Log.Infof("Periodic snapshot check task registered with schedule '%s' (EntryID: %s)", schedule, entryID)
+    }
+
+    // 启动 Scheduler (需要在一个 goroutine 中运行)
+    go func() {
+        a.Log.Info("Asynq scheduler starting...")
+        if err := scheduler.Run(); err != nil {
+            // 通常 scheduler.Run() 在正常关闭时也会返回错误
+             if !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, asynq.ErrServerClosed){ // 检查是否是关闭错误
+                 a.Log.Errorf("Asynq scheduler Run() failed: %v", err)
+             } else {
+                 a.Log.Info("Asynq scheduler stopped.")
+             }
+        }
+    }()
+    // 注意：优雅关闭时可能也需要停止 scheduler
 }
 
 // Shutdown 优雅地关闭应用
