@@ -195,7 +195,7 @@ func NewApp() (*App, error) {
 
 	// 6. 初始化 Hub (注入 Redis Client 和 Prefix)
 	log.Info("Initializing hub...")
-	hubInstance := hub.NewHub(collabService, snapshotService, asynqClient, redisClient, cfg.KeyPrefix)
+	hubInstance := hub.NewHub(collabService, snapshotService, asynqClient, redisClient, cfg.KeyPrefix, stateRepo)
 	log.Info("Hub initialized")
 
 	// 7. 初始化 Handlers

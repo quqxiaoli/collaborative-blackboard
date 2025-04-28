@@ -32,6 +32,9 @@ type StateRepository interface {
 	// ResetOpCount 重置房间的操作计数器（通常在生成快照后调用）。
 	ResetOpCount(ctx context.Context, roomID uint) error
 
+	// 清理房间相关的 Redis key
+	CleanupRoomState(ctx context.Context, roomID uint) error 
+	
 	// === Action History for OT ===
 
 	// GetRecentActions 获取存储在 Redis 中的最近操作记录（用于 OT）。

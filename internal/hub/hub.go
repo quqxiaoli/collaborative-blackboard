@@ -10,9 +10,11 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
+
 	// 导入正确的路径
 	// 需要 domain.Snapshot 等
 	"collaborative-blackboard/internal/domain"
+	"collaborative-blackboard/internal/repository"
 	"collaborative-blackboard/internal/service"
 	"collaborative-blackboard/internal/tasks" // 导入任务定义包
 
@@ -71,10 +73,12 @@ type Hub struct {
 	// 用于管理每个房间订阅 Goroutine 的 context cancel func
 	roomSubscriptions map[uint]context.CancelFunc
 	subMu             sync.Mutex // 保护 roomSubscriptions map 的访问
+
+	stateRepo repository.StateRepository
 }
 
 // NewHub 创建并返回一个新的 Hub 实例
-func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client, redisClient *redis.Client, keyPrefix string) *Hub {
+func NewHub(collabService *service.CollaborationService, snapshotService *service.SnapshotService, asynqClient *asynq.Client, redisClient *redis.Client, keyPrefix string,stateRepo repository.StateRepository,) *Hub {
 	// 启动时检查依赖注入是否有效
 	if collabService == nil {
 		panic("CollaborationService cannot be nil for Hub")
@@ -87,7 +91,10 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 	}
 	if redisClient == nil {
 		panic("Redis client cannot be nil for Hub")
-	} // 检查依赖
+	} 
+	if stateRepo == nil { 
+		panic("StateRepository cannot be nil for Hub") 
+	}
 	if keyPrefix == "" {
 		keyPrefix = "bb:"
 	} // 设置默认前缀
@@ -101,6 +108,7 @@ func NewHub(collabService *service.CollaborationService, snapshotService *servic
 		redisClient:       redisClient,                       // 存储依赖
 		keyPrefix:         keyPrefix,                         // 存储依赖
 		roomSubscriptions: make(map[uint]context.CancelFunc), // 初始化 map
+		stateRepo: stateRepo,
 	}
 }
 
@@ -198,6 +206,7 @@ func (h *Hub) unregisterClient(client *Client) {
 		"action":  "unregisterClient",
 	})
 	shouldStopSubscription := false // 标记是否需要停止订阅
+	shouldCleanupRoomState := false // 标记是否需要清理房间状态
 
 	h.roomsMu.Lock()
 	if roomClients, roomExists := h.rooms[roomID]; roomExists {
@@ -216,6 +225,7 @@ func (h *Hub) unregisterClient(client *Client) {
 				delete(h.rooms, roomID) // 从 Hub 中移除房间
 				logCtx.Info("Room empty, removed from Hub")
 				shouldStopSubscription = true // 标记需要停止此房间的订阅
+				shouldCleanupRoomState = true // 标记需要清理房间状态
 			}
 		} else {
 			logCtx.Warn("Client not found in room during unregister")
@@ -232,6 +242,23 @@ func (h *Hub) unregisterClient(client *Client) {
 		h.stopRoomSubscription(roomID) // 调用停止订阅的方法
 	}
 	// --- 订阅逻辑结束 ---
+
+	// --- 如果房间空了，异步清理 Redis 状态 ---
+    if shouldCleanupRoomState {
+		logCtx.Info("Room is empty, triggering Redis state cleanup...")
+		go func(rID uint) {
+			// 使用后台 context
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // 设置超时
+			defer cancel()
+			if err := h.stateRepo.CleanupRoomState(cleanupCtx, rID); err != nil {
+				// 只记录错误，不影响主流程
+				logrus.WithError(err).Errorf("Failed to cleanup Redis state for room %d", rID)
+			} else {
+				logrus.Infof("Successfully cleaned up Redis state for empty room %d", rID)
+			}
+		}(roomID)
+   }
+   // --- 清理逻辑结束 ---
 }
 
 // runClientCleanupLoop 启动一个定时的循环来执行客户端清理检查

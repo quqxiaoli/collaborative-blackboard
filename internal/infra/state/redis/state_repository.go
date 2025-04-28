@@ -319,3 +319,25 @@ func (r *RedisStateRepository) SetLastSnapshotTime(ctx context.Context, roomID u
 	}
 	return nil
 }
+
+func (r *RedisStateRepository) CleanupRoomState(ctx context.Context, roomID uint) error {
+    keysToDelete := []string{
+        r.roomStateKey(roomID),
+        r.roomVersionKey(roomID),
+        r.roomOpCountKey(roomID),
+        r.roomActionHistoryKey(roomID),
+        r.roomSnapshotCacheKey(roomID),
+        r.roomLastSnapshotTimeKey(roomID), // 也清理上次快照时间
+    }
+
+    // 使用 Del 命令批量删除 key
+    // Del 返回成功删除的 key 的数量，如果 key 不存在也不会报错
+    deletedCount, err := r.client.Del(ctx, keysToDelete...).Result()
+    if err != nil {
+        // 记录错误，但可能不是致命的
+        logrus.WithError(err).Warnf("Redis: Failed to delete some keys during room cleanup for room %d", roomID)
+        return fmt.Errorf("redis: failed to cleanup room state for room %d: %w", roomID, err)
+    }
+    logrus.Infof("Redis: Cleaned up %d keys for room %d", deletedCount, roomID)
+    return nil
+}
