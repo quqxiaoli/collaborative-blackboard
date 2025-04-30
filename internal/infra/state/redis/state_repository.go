@@ -347,50 +347,48 @@ func (r *RedisStateRepository) SetLastSnapshotTime(ctx context.Context, roomID u
 }
 
 func (r *RedisStateRepository) CleanupRoomState(ctx context.Context, roomID uint) error {
-    keysToDelete := []string{
-        r.roomStateKey(roomID),
-        r.roomVersionKey(roomID),
-        r.roomOpCountKey(roomID),
-        r.roomActionHistoryKey(roomID),
-        r.roomSnapshotCacheKey(roomID),
-        r.roomLastSnapshotTimeKey(roomID), // 也清理上次快照时间
-    }
+	keysToDelete := []string{
+		r.roomStateKey(roomID),
+		r.roomVersionKey(roomID),
+		r.roomOpCountKey(roomID),
+		r.roomActionHistoryKey(roomID),
+		r.roomSnapshotCacheKey(roomID),
+		r.roomLastSnapshotTimeKey(roomID), // 也清理上次快照时间
+	}
 
-    // 使用 Del 命令批量删除 key
-    // Del 返回成功删除的 key 的数量，如果 key 不存在也不会报错
-    deletedCount, err := r.client.Del(ctx, keysToDelete...).Result()
-    if err != nil {
-        // 记录错误，但可能不是致命的
-        logrus.WithError(err).Warnf("Redis: Failed to delete some keys during room cleanup for room %d", roomID)
-        return fmt.Errorf("redis: failed to cleanup room state for room %d: %w", roomID, err)
-    }
-    logrus.Infof("Redis: Cleaned up %d keys for room %d", deletedCount, roomID)
-    return nil
+	// 使用 Del 命令批量删除 key
+	// Del 返回成功删除的 key 的数量，如果 key 不存在也不会报错
+	deletedCount, err := r.client.Del(ctx, keysToDelete...).Result()
+	if err != nil {
+		// 记录错误，但可能不是致命的
+		logrus.WithError(err).Warnf("Redis: Failed to delete some keys during room cleanup for room %d", roomID)
+		return fmt.Errorf("redis: failed to cleanup room state for room %d: %w", roomID, err)
+	}
+	logrus.Infof("Redis: Cleaned up %d keys for room %d", deletedCount, roomID)
+	return nil
 }
 
-func (r *RedisStateRepository) ApplyActionAndIncrementVersionAtomically(ctx context.Context, roomID uint, actionData domain.DrawData) (uint, error) {
+func (r *RedisStateRepository) ApplyActionDataAndIncrementVersionAtomically(ctx context.Context, roomID uint, actionType string, actionData domain.DrawData) (uint, error) {
 	stateKey := r.roomStateKey(roomID)
 	versionKey := r.roomVersionKey(roomID)
 	fieldKey := fmt.Sprintf("%d:%d", actionData.X, actionData.Y)
 
-    // 根据 DrawData 判断 actionType 和 colorValue
-    var actionType string
-    var colorValue string
-    if actionData.Color != "" { // 假设 color 非空代表 draw
-         actionType = "draw"
-         colorValue = actionData.Color
-    } else { // color 为空代表 erase
-         actionType = "erase"
-         colorValue = "" // 对于 HDEL，这个值其实不重要
-    }
-
+	// 根据 DrawData 判断 actionType 和 colorValue
+	var colorValue string
+	if actionData.Color != "" { // 假设 color 非空代表 draw
+		actionType = "draw"
+		colorValue = actionData.Color
+	} else { // color 为空代表 erase
+		actionType = "erase"
+		colorValue = "" // 对于 HDEL，这个值其实不重要
+	}
 
 	// 执行 Lua 脚本
 	result, err := applyAndIncrScript.Run(ctx, r.client, []string{stateKey, versionKey}, fieldKey, colorValue, actionType).Result()
 
 	if err != nil {
 		// 检查是否是脚本未加载错误，如果是可以尝试加载并重试 (更健壮的实现)
-        // if redis.HasErrorPrefix(err, "NOSCRIPT") { ... }
+		// if redis.HasErrorPrefix(err, "NOSCRIPT") { ... }
 		return 0, fmt.Errorf("redis: failed to run applyAndIncr Lua script for room %d: %w", roomID, err)
 	}
 

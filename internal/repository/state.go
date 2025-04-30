@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"time"
+
 	// 使用正确的模块路径替换 "collaborative-blackboard"
 	"collaborative-blackboard/internal/domain"
 )
@@ -33,8 +34,8 @@ type StateRepository interface {
 	ResetOpCount(ctx context.Context, roomID uint) error
 
 	// 清理房间相关的 Redis key
-	CleanupRoomState(ctx context.Context, roomID uint) error 
-	
+	CleanupRoomState(ctx context.Context, roomID uint) error
+
 	// === Action History for OT ===
 
 	// GetRecentActions 获取存储在 Redis 中的最近操作记录（用于 OT）。
@@ -72,11 +73,9 @@ type StateRepository interface {
 	// 可以考虑设置一个合理的过期时间，例如几天，防止无用 key 堆积
 	SetLastSnapshotTime(ctx context.Context, roomID uint, timestamp time.Time, ttl time.Duration) error
 
-
 	// ApplyActionDataAndIncrementVersionAtomically 原子地应用操作数据并增加版本号。
-    // actionType: "draw" or "erase" etc.
-    // actionData: 包含坐标、颜色等信息。
-    // 返回新的版本号或错误。
-    ApplyActionDataAndIncrementVersionAtomically(ctx context.Context, roomID uint, actionType string, actionData domain.DrawData) (uint, error)
+	// actionType: "draw" or "erase" etc.
+	// actionData: 包含坐标、颜色等信息。
+	// 返回新的版本号或错误。
+	ApplyActionDataAndIncrementVersionAtomically(ctx context.Context, roomID uint, actionType string, actionData domain.DrawData) (uint, error)
 }
-
