@@ -25,6 +25,32 @@ type RedisStateRepository struct {
 	keyPrefix string
 }
 
+// Lua 脚本：原子地应用 DrawData (HSet/HDel) 并增加版本号 (INCR)
+// KEYS[1]: room state key (e.g., "bb:room:1:state")
+// KEYS[2]: room version key (e.g., "bb:room:1:version")
+// ARGV[1]: field key for HSet/HDel (e.g., "10:20")
+// ARGV[2]: color value for HSet (or empty string/special value for HDel)
+// ARGV[3]: action type ("draw" or "erase")
+var applyAndIncrScript = redis.NewScript(`
+    local fieldKey = ARGV[1]
+    local colorValue = ARGV[2]
+    local actionType = ARGV[3]
+    local stateKey = KEYS[1]
+    local versionKey = KEYS[2]
+
+    -- Apply action to state
+    if actionType == 'draw' then
+        redis.call('HSET', stateKey, fieldKey, colorValue)
+    elseif actionType == 'erase' then
+        redis.call('HDEL', stateKey, fieldKey)
+    end
+
+    -- Increment version
+    local newVersion = redis.call('INCR', versionKey)
+
+    return newVersion
+`)
+
 // NewRedisStateRepository 创建 RedisStateRepository 实例
 func NewRedisStateRepository(client *redis.Client, keyPrefix string) *RedisStateRepository {
 	if client == nil {
@@ -340,4 +366,39 @@ func (r *RedisStateRepository) CleanupRoomState(ctx context.Context, roomID uint
     }
     logrus.Infof("Redis: Cleaned up %d keys for room %d", deletedCount, roomID)
     return nil
+}
+
+func (r *RedisStateRepository) ApplyActionAndIncrementVersionAtomically(ctx context.Context, roomID uint, actionData domain.DrawData) (uint, error) {
+	stateKey := r.roomStateKey(roomID)
+	versionKey := r.roomVersionKey(roomID)
+	fieldKey := fmt.Sprintf("%d:%d", actionData.X, actionData.Y)
+
+    // 根据 DrawData 判断 actionType 和 colorValue
+    var actionType string
+    var colorValue string
+    if actionData.Color != "" { // 假设 color 非空代表 draw
+         actionType = "draw"
+         colorValue = actionData.Color
+    } else { // color 为空代表 erase
+         actionType = "erase"
+         colorValue = "" // 对于 HDEL，这个值其实不重要
+    }
+
+
+	// 执行 Lua 脚本
+	result, err := applyAndIncrScript.Run(ctx, r.client, []string{stateKey, versionKey}, fieldKey, colorValue, actionType).Result()
+
+	if err != nil {
+		// 检查是否是脚本未加载错误，如果是可以尝试加载并重试 (更健壮的实现)
+        // if redis.HasErrorPrefix(err, "NOSCRIPT") { ... }
+		return 0, fmt.Errorf("redis: failed to run applyAndIncr Lua script for room %d: %w", roomID, err)
+	}
+
+	// 解析 Lua 脚本返回的新版本号 (它返回的是 int64)
+	newVersionInt, ok := result.(int64)
+	if !ok {
+		return 0, fmt.Errorf("redis: unexpected result type from applyAndIncr Lua script: %T", result)
+	}
+
+	return uint(newVersionInt), nil // 转换为 uint 返回
 }

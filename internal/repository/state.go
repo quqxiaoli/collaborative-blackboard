@@ -71,4 +71,12 @@ type StateRepository interface {
 	// SetLastSnapshotTime 设置指定房间上次快照的时间戳 (存储到 Redis)
 	// 可以考虑设置一个合理的过期时间，例如几天，防止无用 key 堆积
 	SetLastSnapshotTime(ctx context.Context, roomID uint, timestamp time.Time, ttl time.Duration) error
+
+
+	// ApplyActionDataAndIncrementVersionAtomically 原子地应用操作数据并增加版本号。
+    // actionType: "draw" or "erase" etc.
+    // actionData: 包含坐标、颜色等信息。
+    // 返回新的版本号或错误。
+    ApplyActionDataAndIncrementVersionAtomically(ctx context.Context, roomID uint, actionType string, actionData domain.DrawData) (uint, error)
 }
+
