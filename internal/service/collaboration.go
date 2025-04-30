@@ -135,4 +135,3 @@ func (s *CollaborationService) basicTransform(ctx context.Context, currentAction
 	/* ... (OT 逻辑骨架不变) ... */
 }
 
-// --- 其他方法不变 ---

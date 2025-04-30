@@ -125,41 +125,41 @@ func MigrateDB(db *gorm.DB) error {
 // }
 
 // createRoomsTable 使用传入的 db 创建 rooms 表，并返回错误
-func createRoomsTable(db *gorm.DB) error {
-	sql := `
-	CREATE TABLE rooms (
-		id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-		creator_id BIGINT UNSIGNED NOT NULL,
-		invite_code VARCHAR(191) NOT NULL, -- 限制长度以匹配索引
-		created_at DATETIME(3),
-		last_active DATETIME(3),
-		updated_at DATETIME(3),
-		INDEX idx_creator_id (creator_id),
-		INDEX idx_last_active (last_active),
-		UNIQUE INDEX idx_invite_code (invite_code) -- GORM 会自动处理长度，或保持 (191)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
-	`
-	if err := db.Exec(sql).Error; err != nil {
-		logrus.Errorf("Failed to create rooms table: %v", err)
-		return fmt.Errorf("failed to create rooms table: %w", err)
-	}
-	logrus.Info("Rooms table created successfully")
-	return nil
-}
+// func createRoomsTable(db *gorm.DB) error {
+// 	sql := `
+// 	CREATE TABLE rooms (
+// 		id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+// 		creator_id BIGINT UNSIGNED NOT NULL,
+// 		invite_code VARCHAR(191) NOT NULL, -- 限制长度以匹配索引
+// 		created_at DATETIME(3),
+// 		last_active DATETIME(3),
+// 		updated_at DATETIME(3),
+// 		INDEX idx_creator_id (creator_id),
+// 		INDEX idx_last_active (last_active),
+// 		UNIQUE INDEX idx_invite_code (invite_code) -- GORM 会自动处理长度，或保持 (191)
+// 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+// 	`
+// 	if err := db.Exec(sql).Error; err != nil {
+// 		logrus.Errorf("Failed to create rooms table: %v", err)
+// 		return fmt.Errorf("failed to create rooms table: %w", err)
+// 	}
+// 	logrus.Info("Rooms table created successfully")
+// 	return nil
+// }
 
 // updateRoomsTable 使用传入的 db 修改 rooms 表，并返回错误
-func updateRoomsTable(db *gorm.DB) error {
-	// 同样，优先使用 db.Migrator() 或 AutoMigrate
-	// 确保 domain.Room 结构体有正确的 GORM 索引标签：
-	// type Room struct {
-	//     ...
-	//     InviteCode string `gorm:"uniqueIndex:idx_invite_code,size:191"`
-	// }
-	if err := db.AutoMigrate(&domain.Room{}); err != nil {
-		logrus.Errorf("Failed to auto-migrate Room table for index updates: %v", err)
-		return fmt.Errorf("failed to migrate room indexes: %w", err)
-	}
+// func updateRoomsTable(db *gorm.DB) error {
+// 	// 同样，优先使用 db.Migrator() 或 AutoMigrate
+// 	// 确保 domain.Room 结构体有正确的 GORM 索引标签：
+// 	// type Room struct {
+// 	//     ...
+// 	//     InviteCode string `gorm:"uniqueIndex:idx_invite_code,size:191"`
+// 	// }
+// 	if err := db.AutoMigrate(&domain.Room{}); err != nil {
+// 		logrus.Errorf("Failed to auto-migrate Room table for index updates: %v", err)
+// 		return fmt.Errorf("failed to migrate room indexes: %w", err)
+// 	}
 
-	logrus.Info("Rooms table schema checked/updated successfully")
-	return nil
-}
+// 	logrus.Info("Rooms table schema checked/updated successfully")
+// 	return nil
+// }
