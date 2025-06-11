@@ -44,13 +44,14 @@ func (c *Client) ReadPump() {
 	defer func() {
 		// 清理操作：请求 Hub 注销此客户端
 		unregisterMsg := HubMessage{Type: "unregister", Client: c}
-		// 尝试发送到 Hub，忽略错误（Hub 可能已停止）
-		select {
-		case c.hub.messageChan <- unregisterMsg:
-		// 添加一个超时或默认 case，以防 Hub 阻塞
-		case <-time.After(1 * time.Second): // 可选的超时
-			logrus.WithFields(logrus.Fields{"user_id": c.userID, "room_id": c.roomID}).Warn("Timeout sending unregister message to Hub channel")
-		}
+		// 使用 QueueMessage 发送注销请求
+        logFields := logrus.Fields{"user_id": c.userID, "room_id": c.roomID}
+        if !c.hub.QueueMessage(unregisterMsg) { // 调用非阻塞的 QueueMessage
+             logrus.WithFields(logFields).Warn("Hub message channel full, failed to queue unregister message")
+             // 注意：如果 QueueMessage 失败，Hub 可能不会收到注销信息，但这通常发生在 Hub 负载极高或即将关闭时
+        } else {
+             logrus.WithFields(logFields).Debug("Unregister message queued to Hub")
+        }
 		c.conn.Close() // 关闭 WebSocket 连接
 		logrus.WithFields(logrus.Fields{"user_id": c.userID, "room_id": c.roomID}).Info("readPump exited, unregistered client")
 	}()
@@ -91,13 +92,10 @@ func (c *Client) ReadPump() {
 				RawData: message, // 发送原始字节数据
 			}
 
-			// 非阻塞发送到 Hub，如果 Hub 处理不过来则丢弃
-			select {
-			case c.hub.messageChan <- actionMsg:
-				logCtx.Debug("Raw message sent to Hub channel")
-			default:
-				// 这种情况通常表示系统负载过高或 Hub 处理逻辑有阻塞
+			if !c.hub.QueueMessage(actionMsg) { // 使用 QueueMessage
 				logCtx.Warn("Hub message channel full, dropping client message")
+			} else {
+				logCtx.Debug("Raw message sent to Hub via QueueMessage")
 			}
 		} else {
 			logrus.WithFields(logrus.Fields{"user_id": c.userID, "room_id": c.roomID}).Debugf("Received non-text message type: %d", messageType)

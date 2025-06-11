@@ -25,7 +25,7 @@ type CollaborationService struct {
 	//snapshotRepo repository.SnapshotRepository // 读写 DB 快照
 	//roomRepo     repository.RoomRepository     // 获取房间信息
 	//快照逻辑移到和DB持久化已移出，不需要这两个Repo了
-	// pubsubRepo repository.PubSubRepository // 如果将发布进一步抽象
+	//pubsubRepo repository.PubSubRepository // 如果将发布进一步抽象
 	// otTransformer *ot.Transformer
 }
 

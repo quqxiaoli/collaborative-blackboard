@@ -668,9 +668,9 @@ func (h *Hub) GetActiveRoomIDs() []uint {
 // 但如果 WebSocketHandler 确实需要阻塞等待 Hub 接受注册消息，可以使用这个。
 // 考虑到我们之前在 Handler 中使用了 select default，QueueMessage 可能是更一致的选择。
 // 我们暂时添加它以解决编译错误，但可以考虑是否真的需要它。
-func (h *Hub) MessageChan() chan<- HubMessage {
-	return h.messageChan
-}
+// func (h *Hub) MessageChan() chan<- HubMessage {
+// 	return h.messageChan
+// }
 
 // --- 不再包含 Client, NewClient, readPump, writePump ---
 // --- 也不再包含后台任务逻辑 ---

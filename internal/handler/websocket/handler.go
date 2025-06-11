@@ -40,7 +40,7 @@ func NewWebSocketHandler(hub *hub.Hub, roomService *service.RoomService,allowedO
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
             if origin == "" {
-                 // 不允许没有 Origin 头或者 Origin 为空的请求 (除非你有特定需要)
+                 // 不允许没有 Origin 头或者 Origin 为空的请求 (除非有特定需要)
                 logrus.Warnf("WS Handler: Connection attempt with empty Origin header from %s", r.RemoteAddr)
                 return false
 		}
@@ -105,8 +105,7 @@ func (h *WebSocketHandler) HandleConnection(c *gin.Context) {
 	// 这里不需要完整的房间信息，只需要确认房间存在即可。
 	// 可以考虑在 RoomService 或 RoomRepository 添加一个 RoomExists(id uint) bool 方法。
 	// 或者，暂时继续使用 FindByID。
-	_, err = h.roomService.JoinRoom(c.Request.Context(), userID, "") // 复用 JoinRoom 逻辑，或者调用 FindByID
-	// _, err = h.roomService.FindRoomByID(c.Request.Context(), roomID) // 假设有 FindRoomByID
+	_, err = h.roomService.FindRoomByID(c.Request.Context(), roomID) 
 	if err != nil {
 		if errors.Is(err, service.ErrRoomNotFound) { // 检查业务错误
 			logCtx.WithError(err).Warn("WS Handler: Room not found")
@@ -130,7 +129,7 @@ func (h *WebSocketHandler) HandleConnection(c *gin.Context) {
 	logCtx.Info("WS Handler: Connection upgraded to WebSocket")
 
 	// 5. 创建 Client 对象
-	client := hub.NewClient(h.hub, conn, roomID, userID) // 假设 Hub 包提供了 NewClient 函数
+	client := hub.NewClient(h.hub, conn, roomID, userID) 
 
 	registerMsg := hub.HubMessage{
 		Type:   "register",
@@ -148,15 +147,11 @@ func (h *WebSocketHandler) HandleConnection(c *gin.Context) {
 	}
 	logCtx.Info("WS Handler: Client registration request queued to Hub")
 
-	// 7. 启动客户端的读写 Goroutine (这里也需要修改)
-	// 我们需要将启动 goroutine 的调用移到 Client 对象本身的方法中，
-	// 或者确保 Hub 在处理完 "register" 消息后启动它们。
-	// 暂时先注释掉这里的启动，因为之前的报错显示 ReadPump 未导出。
 
-	// *** 或者更好的方式：让 Client 自己启动 ***
-	go client.Run() // 假设 Client 有一个 Run 方法来启动 readPump 和 writePump
+	// 让 Client 自己启动 
+	go client.Run() //  Client 有一个 Run 方法来启动 readPump 和 writePump
 
 	logCtx.Info("WS Handler: Client read/write pumps started")
-	// 注意：一旦启动了 goroutine，这个 HandleConnection 函数就结束了。
+	// 一旦启动了 goroutine，这个 HandleConnection 函数就结束了。
 	// 后续的 WebSocket 通信由 client.readPump 和 client.writePump 处理。
 }
