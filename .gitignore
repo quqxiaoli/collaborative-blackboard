@@ -1,2 +1,8 @@
 .env
 .aider*
+
+# 系统与生成文件
+.DS_Store
+dump.rdb
+project_code_dump.txt
+*.log
